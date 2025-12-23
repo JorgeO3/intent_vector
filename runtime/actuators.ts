@@ -1,4 +1,3 @@
-// runtime/actuators.ts
 import type { IslandHandle, IslandsRegistry, IslandTypeDef } from "./types.ts";
 import { IslandFlags } from "./types.ts";
 
@@ -14,26 +13,28 @@ export type ActuatorConfig = {
 export type PrefetchHandle = {
   readonly kind: "modulepreload" | "fetch";
   readonly abort?: () => void;
+  /**
+   * Optional completion signal.
+   * - fetch: resolves when fetch settles
+   * - modulepreload: resolves on link load/error when link is created by us
+   */
+  readonly done?: Promise<void>;
 };
 
 type ModuleNamespace = Record<string, unknown>;
-
 type HydrateFn = (el: HTMLElement, props: unknown) => unknown;
-
 type HandlerFn = (event: Event, ctx: unknown) => unknown;
-
-type PrefetchTarget = IslandHandle | { entry: string };
-
-type PrefetchableResource = IslandTypeDef | { entry: string };
+type PrefetchTarget = IslandHandle | { readonly entry: string };
+type PrefetchableResource = IslandTypeDef | { readonly entry: string };
 
 type ScriptElementWithSupport = typeof HTMLScriptElement & {
   supports?: (type: string) => boolean;
 };
 
 type SpeculationRulesConfig = {
-  prefetch: Array<{
-    source: "list";
-    urls: string[];
+  readonly prefetch: ReadonlyArray<{
+    readonly source: "list";
+    readonly urls: readonly string[];
   }>;
 };
 
@@ -66,6 +67,33 @@ const LINK_CROSS_ORIGIN = "anonymous";
 const SPECULATION_SCRIPT_TYPE = "speculationrules";
 
 // ============================================================================
+// Environment Guards (SSR safety)
+// ============================================================================
+
+function canUseDOM(): boolean {
+  return typeof document !== "undefined" && typeof HTMLElement !== "undefined";
+}
+
+let speculationRulesSupport: boolean | null = null;
+
+function supportsSpeculationRules(): boolean {
+  if (speculationRulesSupport !== null) {
+    return speculationRulesSupport;
+  }
+
+  if (!canUseDOM() || typeof HTMLScriptElement === "undefined") {
+    speculationRulesSupport = false;
+    return false;
+  }
+
+  const scriptElement = HTMLScriptElement as ScriptElementWithSupport;
+  speculationRulesSupport = typeof scriptElement.supports === "function" &&
+    scriptElement.supports(SPECULATION_SCRIPT_TYPE);
+
+  return speculationRulesSupport;
+}
+
+// ============================================================================
 // Actuators Class
 // ============================================================================
 
@@ -73,7 +101,19 @@ export class Actuators {
   private config: ActuatorConfig;
   private registry: IslandsRegistry;
 
+  // Deduplication & caches
   private readonly speculatedUrls = new Set<string>();
+  private readonly modulePreloaded = new Set<string>();
+  private readonly prefetchLinked = new Set<string>();
+
+  // Completion tracking (helps future scheduler integration)
+  private readonly modulePreloadDone = new Map<string, Promise<void>>();
+
+  // Speculation Rules batching (single script)
+  private speculationScript: HTMLScriptElement | null = null;
+  private speculationFlushScheduled = false;
+
+  // Module caches
   private readonly handlerModules = new Map<string, ModuleNamespace>();
   private readonly islandModules = new Map<string, ModuleNamespace>();
 
@@ -86,23 +126,47 @@ export class Actuators {
     this.registry = registry;
   }
 
+  /**
+   * Clear URL speculation state (useful on route changes).
+   * Keeps module caches intact.
+   */
+  resetSpeculation(): void {
+    this.speculatedUrls.clear();
+    this.prefetchLinked.clear();
+
+    if (canUseDOM() && this.speculationScript) {
+      this.speculationScript.remove();
+    }
+
+    this.speculationScript = null;
+    this.speculationFlushScheduled = false;
+  }
+
+  // Overload signatures
   prefetch(handle: IslandHandle): PrefetchHandle | null;
-  prefetch(type: { entry: string }, flags: number): PrefetchHandle | null;
+  prefetch(
+    type: { readonly entry: string },
+    flags: number,
+  ): PrefetchHandle | null;
   prefetch(
     target: PrefetchTarget,
     explicitFlags?: number,
   ): PrefetchHandle | null {
-    const type = resolveIslandType(target, this.registry);
-    if (!type) return null;
+    const resource = this.resolveIslandType(target);
+    if (!resource) {
+      return null;
+    }
 
-    const flags = resolveFlags(target, explicitFlags);
-    if (!isPrefetchSafe(flags)) return null;
+    const flags = this.resolveFlags(target, explicitFlags);
+    if (!isPrefetchSafe(flags)) {
+      return null;
+    }
 
-    return this.executePrefetch(type.entry);
+    return this.executePrefetch(resource.entry);
   }
 
   async hydrate(handle: IslandHandle, props: unknown): Promise<unknown> {
-    const type = getIslandType(handle.typeId, this.registry);
+    const type = this.getIslandType(handle.typeId);
     const module = await this.loadIslandModule(type.entry);
     const hydrateFn = resolveHydrateFn(module, type);
 
@@ -117,34 +181,51 @@ export class Actuators {
     const module = await this.loadHandlerModule(entryUrl);
     const handlerFn = resolveHandlerFn(module);
 
-    if (!handlerFn) return;
+    if (!handlerFn) {
+      return undefined;
+    }
 
     return handlerFn(event, ctx);
   }
 
   getNavUrl(typeId: number, props: unknown): string | null {
     const type = this.registry.types[typeId];
-    if (!type?.navProp) return null;
+    if (!type?.navProp) {
+      return null;
+    }
 
     return extractNavUrl(props, type.navProp);
   }
 
   speculatePrefetchUrl(url: string): void {
-    if (!url || this.speculatedUrls.has(url)) return;
-
-    if (supportsSpeculationRules()) {
-      injectSpeculationRules(url);
-    } else {
-      injectPrefetchLink(url);
+    if (!url || this.speculatedUrls.has(url)) {
+      return;
     }
 
     this.speculatedUrls.add(url);
+
+    if (!canUseDOM()) {
+      return;
+    }
+
+    if (supportsSpeculationRules()) {
+      this.scheduleSpeculationFlush();
+    } else {
+      this.ensurePrefetchLink(url);
+    }
   }
 
+  // ========================================================================
+  // Private Methods - Prefetch Implementation
+  // ========================================================================
+
   private executePrefetch(entry: string): PrefetchHandle | null {
+    if (!canUseDOM()) {
+      return null;
+    }
+
     if (this.config.useModulePreload) {
-      ensureModulePreloadLink(entry);
-      return { kind: LINK_REL_TYPES.MODULE_PRELOAD };
+      return this.ensureModulePreload(entry);
     }
 
     if (this.config.useFetchPrefetch) {
@@ -153,6 +234,95 @@ export class Actuators {
 
     return null;
   }
+
+  private ensureModulePreload(href: string): PrefetchHandle {
+    // Check for existing completion promise
+    const existingDone = this.modulePreloadDone.get(href);
+    if (existingDone) {
+      this.modulePreloaded.add(href);
+      return { kind: "modulepreload", done: existingDone };
+    }
+
+    // Already requested but no completion signal tracked
+    if (this.modulePreloaded.has(href)) {
+      return { kind: "modulepreload" };
+    }
+
+    this.modulePreloaded.add(href);
+
+    const link = createModulePreloadLink(href);
+    const done = new Promise<void>((resolve) => {
+      const onDone = () => resolve();
+      link.addEventListener("load", onDone, { once: true });
+      link.addEventListener("error", onDone, { once: true });
+    });
+
+    this.modulePreloadDone.set(href, done);
+
+    // Append after listeners to avoid missing fast load events
+    document.head.appendChild(link);
+
+    return { kind: "modulepreload", done };
+  }
+
+  private ensurePrefetchLink(url: string): void {
+    if (this.prefetchLinked.has(url)) {
+      return;
+    }
+
+    this.prefetchLinked.add(url);
+
+    const link = createPrefetchLink(url);
+    document.head.appendChild(link);
+  }
+
+  // ========================================================================
+  // Private Methods - Speculation Rules
+  // ========================================================================
+
+  private scheduleSpeculationFlush(): void {
+    if (this.speculationFlushScheduled) {
+      return;
+    }
+
+    this.speculationFlushScheduled = true;
+
+    // Batch multiple URLs in same tick to avoid DOM thrashing
+    queueMicrotask(() => {
+      this.speculationFlushScheduled = false;
+      this.flushSpeculationRules();
+    });
+  }
+
+  private flushSpeculationRules(): void {
+    if (!canUseDOM() || !supportsSpeculationRules()) {
+      return;
+    }
+
+    if (this.speculatedUrls.size === 0) {
+      return;
+    }
+
+    // Remove existing script to ensure updates are applied
+    if (this.speculationScript) {
+      this.speculationScript.remove();
+    }
+
+    const urls = Array.from(this.speculatedUrls);
+    const config: SpeculationRulesConfig = {
+      prefetch: [{ source: "list", urls }],
+    };
+
+    const script = createSpeculationScript(config);
+    const target = getDocumentAppendTarget();
+    target.appendChild(script);
+
+    this.speculationScript = script;
+  }
+
+  // ========================================================================
+  // Private Methods - Module Loading
+  // ========================================================================
 
   private loadIslandModule(entry: string): Promise<ModuleNamespace> {
     return this.loadModule(entry, this.islandModules);
@@ -166,62 +336,76 @@ export class Actuators {
     entry: string,
     cache: Map<string, ModuleNamespace>,
   ): Promise<ModuleNamespace> {
-    let module = cache.get(entry);
-
-    if (!module) {
-      module = await importModule(entry);
-      cache.set(entry, module);
+    const cached = cache.get(entry);
+    if (cached) {
+      return cached;
     }
+
+    const module = await importModule(entry);
+    cache.set(entry, module);
 
     return module;
   }
+
+  // ========================================================================
+  // Private Methods - Type Resolution
+  // ========================================================================
+
+  private resolveIslandType(
+    target: PrefetchTarget,
+  ): PrefetchableResource | null {
+    if ("typeId" in target) {
+      return this.registry.types[target.typeId] ?? null;
+    }
+    return target;
+  }
+
+  private resolveFlags(
+    target: PrefetchTarget,
+    explicitFlags?: number,
+  ): number {
+    if (typeof explicitFlags === "number") {
+      return explicitFlags;
+    }
+
+    if ("flags" in target && typeof target.flags === "number") {
+      return target.flags;
+    }
+
+    return 0;
+  }
+
+  private getIslandType(typeId: number): IslandTypeDef {
+    const type = this.registry.types[typeId];
+    if (!type) {
+      throw new Error(`Unknown island typeId=${typeId}`);
+    }
+    return type;
+  }
 }
 
 // ============================================================================
-// Type Resolution Helpers
+// Helper Functions - Type Guards & Checks
 // ============================================================================
-
-function resolveIslandType(
-  target: PrefetchTarget,
-  registry: IslandsRegistry,
-): PrefetchableResource | null {
-  if ("typeId" in target) {
-    return registry.types[target.typeId] ?? null;
-  }
-  return target as { entry: string };
-}
-
-function resolveFlags(target: PrefetchTarget, explicitFlags?: number): number {
-  if (typeof explicitFlags === "number") {
-    return explicitFlags;
-  }
-  if ("flags" in target) {
-    return target.flags;
-  }
-  return 0;
-}
 
 function isPrefetchSafe(flags: number): boolean {
   return (flags & IslandFlags.PrefetchSafe) !== 0;
 }
 
-function getIslandType(
-  typeId: number,
-  registry: IslandsRegistry,
-): IslandTypeDef {
-  const type = registry.types[typeId];
-  if (!type) {
-    throw new Error(`Unknown island typeId=${typeId}`);
-  }
-  return type;
-}
-
 // ============================================================================
-// Module Loading Helpers
+// Helper Functions - Module Loading
 // ============================================================================
 
 async function importModule(entry: string): Promise<ModuleNamespace> {
-  return await import(/* @vite-ignore */ entry) as ModuleNamespace;
+  try {
+    return (await import(/* @vite-ignore */ entry)) as ModuleNamespace;
+  } catch (error) {
+    throw new Error(
+      `Failed to import module: ${entry}. ${
+        error instanceof Error ? error.message : String(error)
+      }`,
+    );
+  }
 }
 
 function resolveHydrateFn(
@@ -230,12 +414,14 @@ function resolveHydrateFn(
 ): HydrateFn {
   const candidate = type.exportName
     ? module[type.exportName]
-    : (module[MODULE_EXPORT_NAMES.HYDRATE] ??
-      module[MODULE_EXPORT_NAMES.DEFAULT]);
+    : module[MODULE_EXPORT_NAMES.HYDRATE] ??
+      module[MODULE_EXPORT_NAMES.DEFAULT];
 
   if (typeof candidate !== "function") {
     throw new Error(
-      `Island module missing hydrate/export/default: ${type.entry}`,
+      `Island module missing hydrate function. Entry: ${type.entry}, Export: ${
+        type.exportName ?? "hydrate/default"
+      }`,
     );
   }
 
@@ -250,35 +436,23 @@ function resolveHandlerFn(module: ModuleNamespace): HandlerFn | null {
 }
 
 // ============================================================================
-// Navigation Helpers
+// Helper Functions - Navigation
 // ============================================================================
 
 function extractNavUrl(props: unknown, navProp: string): string | null {
-  if (!props || typeof props !== "object") return null;
+  if (!props || typeof props !== "object") {
+    return null;
+  }
 
   const record = props as Record<string, unknown>;
   const value = record[navProp];
 
-  return typeof value === "string" && value.length ? value : null;
+  return typeof value === "string" && value.length > 0 ? value : null;
 }
 
 // ============================================================================
-// Prefetch Implementation - Module Preload
+// Helper Functions - Link Creation
 // ============================================================================
-
-function ensureModulePreloadLink(href: string): void {
-  if (modulePreloadExists(href)) return;
-
-  const link = createModulePreloadLink(href);
-  document.head.append(link);
-}
-
-function modulePreloadExists(href: string): boolean {
-  const escapedHref = CSS.escape(href);
-  const selector =
-    `link[rel="${LINK_REL_TYPES.MODULE_PRELOAD}"][href="${escapedHref}"]`;
-  return document.head.querySelector(selector) !== null;
-}
 
 function createModulePreloadLink(href: string): HTMLLinkElement {
   const link = document.createElement("link");
@@ -288,45 +462,38 @@ function createModulePreloadLink(href: string): HTMLLinkElement {
   return link;
 }
 
+function createPrefetchLink(href: string): HTMLLinkElement {
+  const link = document.createElement("link");
+  link.rel = LINK_REL_TYPES.PREFETCH;
+  link.href = href;
+  return link;
+}
+
 // ============================================================================
-// Prefetch Implementation - Fetch API
+// Helper Functions - Fetch Prefetch
 // ============================================================================
 
 function createFetchPrefetch(entry: string): PrefetchHandle {
   const controller = new AbortController();
 
-  fetch(entry, {
+  const done = fetch(entry, {
     signal: controller.signal,
     credentials: FETCH_OPTIONS.credentials as RequestCredentials,
     mode: FETCH_OPTIONS.mode as RequestMode,
-  }).catch(() => {});
+  })
+    .then(() => {})
+    .catch(() => {});
 
   return {
     kind: "fetch",
     abort: () => controller.abort(),
+    done,
   };
 }
 
 // ============================================================================
-// Speculation Rules Support
+// Helper Functions - Speculation Rules
 // ============================================================================
-
-function supportsSpeculationRules(): boolean {
-  const scriptElement = HTMLScriptElement as ScriptElementWithSupport;
-  return typeof scriptElement.supports === "function" &&
-    scriptElement.supports(SPECULATION_SCRIPT_TYPE);
-}
-
-function injectSpeculationRules(url: string): void {
-  const config: SpeculationRulesConfig = {
-    prefetch: [{ source: "list", urls: [url] }],
-  };
-
-  const script = createSpeculationScript(config);
-  const target = getDocumentAppendTarget();
-
-  target.append(script);
-}
 
 function createSpeculationScript(
   config: SpeculationRulesConfig,
@@ -339,20 +506,4 @@ function createSpeculationScript(
 
 function getDocumentAppendTarget(): HTMLElement {
   return document.body ?? document.head ?? document.documentElement;
-}
-
-// ============================================================================
-// Prefetch Fallback - Link Prefetch
-// ============================================================================
-
-function injectPrefetchLink(url: string): void {
-  const link = createPrefetchLink(url);
-  document.head.append(link);
-}
-
-function createPrefetchLink(href: string): HTMLLinkElement {
-  const link = document.createElement("link");
-  link.rel = LINK_REL_TYPES.PREFETCH;
-  link.href = href;
-  return link;
 }

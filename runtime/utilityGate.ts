@@ -1,4 +1,3 @@
-// runtime/utilityGate.ts
 import type { IslandKey, IslandsRegistry, Selection } from "./types.ts";
 import { IslandFlags } from "./types.ts";
 import type { PressureSignals } from "./pressure.ts";

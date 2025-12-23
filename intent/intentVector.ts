@@ -1,4 +1,3 @@
-// intent/intentVector.ts
 import { clamp } from "../runtime/targetLock.ts";
 
 // ============================================================================
@@ -52,6 +51,25 @@ type MotionState = {
   v2: number;
 };
 
+type DerivedConfig = {
+  alphaRefClamped: number;
+  oneMinusAlphaRef: number;
+  vMinSq: number;
+  vBrakeMinSq: number;
+  maxSpeedSq: number;
+  vThetaInvRange: number;
+  bias: number;
+  oneMinusBias: number;
+  lowSpeedScale: number;
+  nearMulSq: number;
+  brakeTauMsClamped: number;
+  // NUEVO: Pre-calcular más valores
+  epsilonInv: number;
+  cosineSqDelta: number; // cosThetaSqFast - cosThetaSqSlow
+  dtRefInv: number;
+  brakeRange: number; // brakeMax - brakeFloor
+};
+
 // ============================================================================
 // Constants
 // ============================================================================
@@ -85,25 +103,20 @@ const SMOOTHING_BOUNDS = {
 } as const;
 
 const BROWN_HOLT_LEVEL_FACTOR = 2.0;
-const MIN_DELTA_TIME = 1.0;
+const MIN_DELTA_TIME_MS = 1.0;
+const MAX_REASONABLE_DT_MS = 1000;
 const MIN_DIVISOR = 1e-6;
 const PERFECT_SCORE = 1.0;
 const ZERO_SCORE = 0.0;
 
 // ============================================================================
-// Intent Vector Class
+// Intent Vector Class - OPTIMIZADO
 // ============================================================================
 
 export class IntentVector {
   private config: IntentVectorConfig;
-
-  private brownHolt: BrownHoltState = {
-    s1x: 0,
-    s1y: 0,
-    s2x: 0,
-    s2y: 0,
-  };
-
+  private d: DerivedConfig;
+  private brownHolt: BrownHoltState = { s1x: 0, s1y: 0, s2x: 0, s2y: 0 };
   private motion: MotionState = {
     px: 0,
     py: 0,
@@ -114,107 +127,179 @@ export class IntentVector {
     v2: 0,
   };
 
+  // Cache por frame
+  private speed = 0;
+  private horizonSq = 0;
+  private coneK = 0;
+  private decelBoost = 0;
+
+  private readonly kinematicsCache: {
+    px: number;
+    py: number;
+    vx: number;
+    vy: number;
+    ax: number;
+    ay: number;
+    v2: number;
+  } = { px: 0, py: 0, vx: 0, vy: 0, ax: 0, ay: 0, v2: 0 };
+
+  private warnedDt = false;
+
   constructor(config?: Partial<IntentVectorConfig>) {
     this.config = { ...DEFAULT_CONFIG, ...config };
+    this.d = computeDerived(this.config);
   }
 
   setConfig(config: Partial<IntentVectorConfig>): void {
     this.config = { ...this.config, ...config };
+    this.d = computeDerived(this.config);
   }
 
   reset(x: number, y: number): void {
-    this.brownHolt = {
-      s1x: x,
-      s1y: y,
-      s2x: x,
-      s2y: y,
-    };
-
-    this.motion = {
-      px: x,
-      py: y,
-      vx: 0,
-      vy: 0,
-      ax: 0,
-      ay: 0,
-      v2: 0,
-    };
+    this.brownHolt.s1x = x;
+    this.brownHolt.s1y = y;
+    this.brownHolt.s2x = x;
+    this.brownHolt.s2y = y;
+    this.motion.px = x;
+    this.motion.py = y;
+    this.motion.vx = 0;
+    this.motion.vy = 0;
+    this.motion.ax = 0;
+    this.motion.ay = 0;
+    this.motion.v2 = 0;
+    this.speed = 0;
+    this.horizonSq = 0;
+    this.coneK = 0;
+    this.decelBoost = 0;
+    this.warnedDt = false;
   }
 
   update(mx: number, my: number, dt: number): void {
-    const safeDt = Math.max(dt, MIN_DELTA_TIME);
-    const alpha = computeSmoothingFactor(safeDt, this.config);
+    if (!this.warnedDt && (dt < 0.5 || dt > MAX_REASONABLE_DT_MS)) {
+      this.warnedDt = true;
+      console.warn(
+        "[IntentVector] dt fuera de rango. ¿Seguro que dt está en ms?",
+        { dt },
+      );
+    }
+
+    const safeDt = dt > MIN_DELTA_TIME_MS ? dt : MIN_DELTA_TIME_MS;
+    const alpha = computeSmoothingFactorFast(safeDt, this.d);
 
     this.updateBrownHolt(mx, my, alpha);
-    this.updateMotionState(safeDt, alpha);
+    this.updateMotionStateFast(safeDt, alpha);
   }
 
   hintVector(dx: number, dy: number, targetRadiusSq: number): number {
-    const distanceSq = dx * dx + dy * dy;
+    const distSq = dx * dx + dy * dy;
 
-    if (distanceSq < this.config.epsilon) {
-      return PERFECT_SCORE;
+    // Early exit: punto de contacto
+    if (distSq < this.config.epsilon) return PERFECT_SCORE;
+
+    // Régimen de baja velocidad
+    if (this.motion.v2 < this.d.vMinSq) {
+      if (distSq <= targetRadiusSq) return PERFECT_SCORE;
+
+      // OPTIMIZACIÓN: Evitar multiplicación si está fuera del rango cercano
+      const nearThresholdSq = this.d.nearMulSq * targetRadiusSq;
+      if (distSq > nearThresholdSq) return ZERO_SCORE;
+
+      // OPTIMIZACIÓN: Proximity inline y simplificado
+      const proximity = targetRadiusSq / (distSq + this.config.epsilon);
+      const prox = proximity > 1 ? 1 : proximity;
+      const s = this.d.lowSpeedScale * prox;
+
+      return s <= 0 ? ZERO_SCORE : (s >= 1 ? PERFECT_SCORE : s);
     }
 
-    const proximity = computeProximity(
-      distanceSq,
-      targetRadiusSq,
-      this.config.epsilon,
-    );
+    // Régimen de alta velocidad: gates baratos primero
+    if (distSq > targetRadiusSq && distSq > this.horizonSq) return ZERO_SCORE;
 
-    // Low-speed near-target evidence
-    if (this.motion.v2 < this.getMinSpeedSquared()) {
-      return this.evaluateLowSpeedRegime(distanceSq, targetRadiusSq, proximity);
+    const dot = this.motion.vx * dx + this.motion.vy * dy;
+    if (dot <= 0) return ZERO_SCORE;
+
+    // Cone gating (optimizado: dot² pre-calculado una sola vez)
+    const dotSq = dot * dot;
+    if (distSq > targetRadiusSq && dotSq < this.coneK * distSq) {
+      return ZERO_SCORE;
     }
 
-    // High-speed motion-based evidence
-    return this.evaluateHighSpeedRegime(
-      dx,
-      dy,
-      distanceSq,
-      targetRadiusSq,
-      proximity,
-    );
+    // OPTIMIZACIÓN: Proximity inline
+    const proximity = targetRadiusSq / (distSq + this.config.epsilon);
+    const prox = proximity > 1 ? 1 : proximity;
+
+    // OPTIMIZACIÓN: Alignment inline (división única)
+    let alignment = dotSq / (this.motion.v2 * distSq + this.config.epsilon);
+    if (alignment > 1) alignment = 1;
+
+    // OPTIMIZACIÓN: Brake evidence simplificado
+    let brake = this.config.brakeFloor;
+    if (this.decelBoost > 0 && this.motion.v2 >= this.d.vBrakeMinSq) {
+      brake = this.config.brakeFloor + this.decelBoost * prox;
+      // Clamp manual más rápido que Math.min/max
+      if (brake > this.config.brakeMax) brake = this.config.brakeMax;
+      else if (brake < this.config.brakeFloor) brake = this.config.brakeFloor;
+    }
+
+    // OPTIMIZACIÓN: Proximity term inline
+    const proxTerm = this.d.bias + this.d.oneMinusBias * prox;
+
+    const score = brake * alignment * proxTerm;
+    return score > 1 ? 1 : (score <= 0 ? 0 : score);
   }
 
   hintToPoint(tx: number, ty: number, targetRadiusSq: number): number {
-    const dx = tx - this.motion.px;
-    const dy = ty - this.motion.py;
-    return this.hintVector(dx, dy, targetRadiusSq);
+    // Inline para evitar call overhead
+    return this.hintVector(
+      tx - this.motion.px,
+      ty - this.motion.py,
+      targetRadiusSq,
+    );
   }
 
   getKinematics(): Kinematics {
-    return { ...this.motion };
+    const k = this.kinematicsCache;
+    k.px = this.motion.px;
+    k.py = this.motion.py;
+    k.vx = this.motion.vx;
+    k.vy = this.motion.vy;
+    k.ax = this.motion.ax;
+    k.ay = this.motion.ay;
+    k.v2 = this.motion.v2;
+    return k;
   }
 
   // ========================================================================
-  // Private - Brown-Holt Smoothing
+  // Private - Brown-Holt (sin cambios, ya es óptimo)
   // ========================================================================
 
   private updateBrownHolt(mx: number, my: number, alpha: number): void {
-    const inverseAlpha = 1.0 - alpha;
-
-    const s1x = alpha * mx + inverseAlpha * this.brownHolt.s1x;
-    const s1y = alpha * my + inverseAlpha * this.brownHolt.s1y;
-    const s2x = alpha * s1x + inverseAlpha * this.brownHolt.s2x;
-    const s2y = alpha * s1y + inverseAlpha * this.brownHolt.s2y;
-
-    this.brownHolt = { s1x, s1y, s2x, s2y };
+    const inv = 1.0 - alpha;
+    const s1x = alpha * mx + inv * this.brownHolt.s1x;
+    const s1y = alpha * my + inv * this.brownHolt.s1y;
+    const s2x = alpha * s1x + inv * this.brownHolt.s2x;
+    const s2y = alpha * s1y + inv * this.brownHolt.s2y;
+    this.brownHolt.s1x = s1x;
+    this.brownHolt.s1y = s1y;
+    this.brownHolt.s2x = s2x;
+    this.brownHolt.s2y = s2y;
   }
 
   // ========================================================================
-  // Private - Motion State Update
+  // Private - Motion State Update OPTIMIZADO
   // ========================================================================
 
-  private updateMotionState(dt: number, alpha: number): void {
+  private updateMotionStateFast(dt: number, alpha: number): void {
     const { s1x, s1y, s2x, s2y } = this.brownHolt;
 
-    // Compute position (level)
+    // Position (level)
     const px = BROWN_HOLT_LEVEL_FACTOR * s1x - s2x;
     const py = BROWN_HOLT_LEVEL_FACTOR * s1y - s2y;
 
-    // Compute velocity (trend)
-    const factor = alpha / Math.max(MIN_DIVISOR, 1.0 - alpha);
+    // Velocity (trend)
+    const oneMinusAlpha = 1.0 - alpha;
+    const factor = alpha /
+      (oneMinusAlpha > MIN_DIVISOR ? oneMinusAlpha : MIN_DIVISOR);
     const trendX = factor * (s1x - s2x);
     const trendY = factor * (s1y - s2y);
 
@@ -222,256 +307,107 @@ export class IntentVector {
     let vx = trendX * invDt;
     let vy = trendY * invDt;
 
-    // Clamp velocity to max
-    const clamped = clampVelocity(vx, vy, this.config.vMax);
-    vx = clamped.vx;
-    vy = clamped.vy;
+    // Clamp velocity (optimizado: sqrt solo cuando necesario)
+    const speedSq = vx * vx + vy * vy;
+    if (speedSq > this.d.maxSpeedSq) {
+      const scale = this.config.vMax / Math.sqrt(speedSq);
+      vx *= scale;
+      vy *= scale;
+    }
 
-    // Compute acceleration
+    // Acceleration
     const ax = (vx - this.motion.vx) * invDt;
     const ay = (vy - this.motion.vy) * invDt;
     const v2 = vx * vx + vy * vy;
 
-    this.motion = { px, py, vx, vy, ax, ay, v2 };
-  }
+    // Write motion state
+    this.motion.px = px;
+    this.motion.py = py;
+    this.motion.vx = vx;
+    this.motion.vy = vy;
+    this.motion.ax = ax;
+    this.motion.ay = ay;
+    this.motion.v2 = v2;
 
-  // ========================================================================
-  // Private - Low Speed Evaluation
-  // ========================================================================
+    // ---- Caches por frame ----
+    this.speed = Math.sqrt(v2);
+    const horizon = this.config.horizonBasePx +
+      this.speed * this.config.horizonMs;
+    this.horizonSq = horizon * horizon;
 
-  private evaluateLowSpeedRegime(
-    distanceSq: number,
-    targetRadiusSq: number,
-    proximity: number,
-  ): number {
-    // Inside target
-    if (distanceSq <= targetRadiusSq) {
-      return PERFECT_SCORE;
-    }
-
-    // Near target
-    const nearMul = Math.max(1.0, this.config.lowSpeedNearMul);
-    const nearRadiusSq = (nearMul * nearMul) * targetRadiusSq;
-
-    if (distanceSq <= nearRadiusSq) {
-      const scale = clamp(this.config.lowSpeedProxScale, 0.0, 1.0);
-      return clamp(scale * proximity, 0.0, 1.0);
-    }
-
-    return ZERO_SCORE;
-  }
-
-  // ========================================================================
-  // Private - High Speed Evaluation
-  // ========================================================================
-
-  private evaluateHighSpeedRegime(
-    dx: number,
-    dy: number,
-    distanceSq: number,
-    targetRadiusSq: number,
-    proximity: number,
-  ): number {
-    const speed = Math.sqrt(this.motion.v2);
-
-    // Dynamic horizon check
-    if (!this.isWithinHorizon(distanceSq, targetRadiusSq, speed)) {
-      return ZERO_SCORE;
-    }
-
-    // Direction alignment check
-    const dotProduct = this.motion.vx * dx + this.motion.vy * dy;
-    if (dotProduct <= 0) {
-      return ZERO_SCORE;
-    }
-
-    // Cone gating
-    if (!this.isWithinCone(distanceSq, targetRadiusSq, dotProduct, speed)) {
-      return ZERO_SCORE;
-    }
-
-    // Compute alignment score
-    const alignment = computeAlignment(
-      dotProduct,
-      this.motion.v2,
-      distanceSq,
-      this.config.epsilon,
+    // OPTIMIZACIÓN: interpolateCosineSq inline
+    const t = clamp(
+      (this.speed - this.config.vMin) * this.d.vThetaInvRange,
+      0,
+      1,
     );
+    const cosThetaSq = this.config.cosThetaSqSlow + this.d.cosineSqDelta * t;
+    this.coneK = cosThetaSq * v2;
 
-    // Compute brake evidence
-    const brake = this.computeBrakeEvidence(speed, proximity);
-
-    // Combine with proximity bias
-    const proximityTerm = computeProximityTerm(
-      proximity,
-      this.config.proximityBias,
-    );
-
-    return Math.min(brake * alignment * proximityTerm, PERFECT_SCORE);
-  }
-
-  // ========================================================================
-  // Private - Gating Checks
-  // ========================================================================
-
-  private isWithinHorizon(
-    distanceSq: number,
-    targetRadiusSq: number,
-    speed: number,
-  ): boolean {
-    const horizon = this.config.horizonBasePx + speed * this.config.horizonMs;
-    const horizonSq = horizon * horizon;
-    return distanceSq <= targetRadiusSq || distanceSq <= horizonSq;
-  }
-
-  private isWithinCone(
-    distanceSq: number,
-    targetRadiusSq: number,
-    dotProduct: number,
-    speed: number,
-  ): boolean {
-    // Inside target radius passes automatically
-    if (distanceSq <= targetRadiusSq) {
-      return true;
+    // Braking boost pre-calculado
+    this.decelBoost = 0;
+    if (v2 >= this.d.vBrakeMinSq) {
+      const dotVA = vx * ax + vy * ay;
+      if (dotVA < 0) {
+        const invV2 = 1.0 / (v2 > this.d.vMinSq ? v2 : this.d.vMinSq);
+        const decel = -dotVA * invV2;
+        this.decelBoost = decel * this.d.brakeTauMsClamped;
+      }
     }
-
-    const cosThetaSq = interpolateCosineSq(speed, this.config);
-    const dotProductSq = dotProduct * dotProduct;
-
-    return dotProductSq >= cosThetaSq * this.motion.v2 * distanceSq;
-  }
-
-  // ========================================================================
-  // Private - Brake Evidence
-  // ========================================================================
-
-  private computeBrakeEvidence(speed: number, proximity: number): number {
-    if (speed < this.config.vBrakeMin) {
-      return this.config.brakeFloor;
-    }
-
-    const deceleration = this.computeDeceleration();
-    if (deceleration <= 0) {
-      return this.config.brakeFloor;
-    }
-
-    const boost = deceleration * Math.max(1.0, this.config.brakeTauMs) *
-      proximity;
-
-    return clamp(
-      this.config.brakeFloor + boost,
-      this.config.brakeFloor,
-      this.config.brakeMax,
-    );
-  }
-
-  private computeDeceleration(): number {
-    const dotProduct = this.motion.vx * this.motion.ax +
-      this.motion.vy * this.motion.ay;
-    if (dotProduct >= 0) return 0;
-
-    const minV2 = this.getMinSpeedSquared();
-    const invV2 = 1.0 / Math.max(this.motion.v2, minV2);
-
-    return -dotProduct * invV2;
-  }
-
-  // ========================================================================
-  // Private - Helpers
-  // ========================================================================
-
-  private getMinSpeedSquared(): number {
-    return this.config.vMin * this.config.vMin;
   }
 }
 
 // ============================================================================
-// Smoothing Calculations
+// Helpers OPTIMIZADOS
 // ============================================================================
 
-function computeSmoothingFactor(
-  dt: number,
-  config: IntentVectorConfig,
-): number {
-  const raw = 1.0 - Math.pow(
-    1.0 - clamp(config.alphaRef, SMOOTHING_BOUNDS.MIN, SMOOTHING_BOUNDS.MAX),
-    dt / Math.max(MIN_DIVISOR, config.dtRefMs),
+function computeDerived(config: IntentVectorConfig): DerivedConfig {
+  const alphaRefClamped = clamp(
+    config.alphaRef,
+    SMOOTHING_BOUNDS.MIN,
+    SMOOTHING_BOUNDS.MAX,
   );
+  const vMinSq = config.vMin * config.vMin;
+  const vBrakeMinSq = config.vBrakeMin * config.vBrakeMin;
+  const maxSpeedSq = config.vMax * config.vMax;
+  const vThetaRange = config.vTheta - config.vMin;
+  const vThetaInvRange = 1.0 /
+    (vThetaRange > MIN_DIVISOR ? vThetaRange : MIN_DIVISOR);
+  const bias = clamp(config.proximityBias, 0.0, 1.0);
+  const oneMinusBias = 1.0 - bias;
+  const lowSpeedScale = clamp(config.lowSpeedProxScale, 0.0, 1.0);
+  const nearMul = config.lowSpeedNearMul > 1.0 ? config.lowSpeedNearMul : 1.0;
+  const nearMulSq = nearMul * nearMul;
+  const brakeTauMsClamped = config.brakeTauMs > 1.0 ? config.brakeTauMs : 1.0;
 
-  return clamp(raw, SMOOTHING_BOUNDS.MIN, SMOOTHING_BOUNDS.MAX);
-}
+  // NUEVO: Pre-calcular más valores
+  const epsilonInv = 1.0 / config.epsilon;
+  const cosineSqDelta = config.cosThetaSqFast - config.cosThetaSqSlow;
+  const dtRefInv = 1.0 /
+    (config.dtRefMs > MIN_DIVISOR ? config.dtRefMs : MIN_DIVISOR);
+  const brakeRange = config.brakeMax - config.brakeFloor;
 
-// ============================================================================
-// Velocity Clamping
-// ============================================================================
-
-function clampVelocity(
-  vx: number,
-  vy: number,
-  maxSpeed: number,
-): { vx: number; vy: number } {
-  const maxSpeedSq = maxSpeed * maxSpeed;
-  const speedSq = vx * vx + vy * vy;
-
-  if (speedSq <= maxSpeedSq) {
-    return { vx, vy };
-  }
-
-  const scale = Math.sqrt(maxSpeedSq / Math.max(MIN_DIVISOR, speedSq));
   return {
-    vx: vx * scale,
-    vy: vy * scale,
+    alphaRefClamped,
+    oneMinusAlphaRef: 1.0 - alphaRefClamped,
+    vMinSq,
+    vBrakeMinSq,
+    maxSpeedSq,
+    vThetaInvRange,
+    bias,
+    oneMinusBias,
+    lowSpeedScale,
+    nearMulSq,
+    brakeTauMsClamped,
+    epsilonInv,
+    cosineSqDelta,
+    dtRefInv,
+    brakeRange,
   };
 }
 
-// ============================================================================
-// Proximity Calculations
-// ============================================================================
-
-function computeProximity(
-  distanceSq: number,
-  targetRadiusSq: number,
-  epsilon: number,
-): number {
-  return Math.min(targetRadiusSq / (distanceSq + epsilon), 1.0);
-}
-
-function computeProximityTerm(proximity: number, bias: number): number {
-  const clampedBias = clamp(bias, 0.0, 1.0);
-  return clampedBias + (1.0 - clampedBias) * proximity;
-}
-
-// ============================================================================
-// Alignment Calculations
-// ============================================================================
-
-function computeAlignment(
-  dotProduct: number,
-  velocitySq: number,
-  distanceSq: number,
-  epsilon: number,
-): number {
-  const dotProductSq = dotProduct * dotProduct;
-  return dotProductSq / (velocitySq * distanceSq + epsilon);
-}
-
-// ============================================================================
-// Cone Interpolation
-// ============================================================================
-
-function interpolateCosineSq(
-  speed: number,
-  config: IntentVectorConfig,
-): number {
-  const t = clamp(
-    (speed - config.vMin) / Math.max(MIN_DIVISOR, config.vTheta - config.vMin),
-    0,
-    1,
-  );
-
-  return lerp(config.cosThetaSqSlow, config.cosThetaSqFast, t);
-}
-
-function lerp(a: number, b: number, t: number): number {
-  return a + (b - a) * t;
+// OPTIMIZACIÓN: Smoothing factor inline-friendly
+function computeSmoothingFactorFast(dt: number, d: DerivedConfig): number {
+  const raw = 1.0 - Math.pow(d.oneMinusAlphaRef, dt * d.dtRefInv);
+  return clamp(raw, SMOOTHING_BOUNDS.MIN, SMOOTHING_BOUNDS.MAX);
 }

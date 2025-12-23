@@ -16,10 +16,6 @@ export type PressureConfig = {
   readonly longTaskBudgetMs: number;
 };
 
-type PerformanceEntryWithDuration = PerformanceEntry & {
-  readonly duration: number;
-};
-
 type EffectiveConnectionType = "slow-2g" | "2g" | "3g" | "4g" | "";
 
 // ============================================================================
@@ -51,11 +47,16 @@ const MIN_DIVISOR = 1;
 
 const PERFORMANCE_ENTRY_TYPE = "longtask";
 
+// Queue compaction knobs (avoid unbounded arrays)
+const COMPACT_HEAD_THRESHOLD = 64;
+const COMPACT_RATIO_NUM = 2; // if head * 2 > len => compact
+
 // ============================================================================
-// Public API - Network Connection
+// Public API - Network Connection (SSR-safe)
 // ============================================================================
 
 export function getConnection(): NetworkInformation | undefined {
+  if (typeof navigator === "undefined") return undefined;
   const nav = navigator as NavigatorWithConnection;
   return nav.connection;
 }
@@ -67,15 +68,28 @@ export function getConnection(): NetworkInformation | undefined {
 export class PressureMonitor {
   private readonly config: PressureConfig;
 
+  // Long task queue (endTime + duration) with head index to avoid shift()
   private longTaskSumMs = 0;
-  private readonly longTaskTimestamps: number[] = [];
-  private readonly longTaskDurations: number[] = [];
+  private longTaskEndTimes: number[] = [];
+  private longTaskDurations: number[] = [];
+  private longTaskHead = 0;
 
   private lastEngineMs = 0;
+
+  private observer: PerformanceObserver | null = null;
 
   constructor(config?: Partial<PressureConfig>) {
     this.config = { ...DEFAULT_CONFIG, ...config };
     this.initializeLongTaskObserver();
+  }
+
+  dispose(): void {
+    try {
+      this.observer?.disconnect();
+    } catch {
+      // ignore
+    }
+    this.observer = null;
   }
 
   setLastEngineCostMs(ms: number): void {
@@ -83,7 +97,7 @@ export class PressureMonitor {
   }
 
   read(): PressureSignals {
-    const now = performance.now();
+    const now = safeNow();
     this.compactLongTasks(now);
 
     const cpuPressure = this.computeCpuPressure();
@@ -92,31 +106,54 @@ export class PressureMonitor {
     return { cpuPressure, netPressure, saveData };
   }
 
+  // ========================================================================
+  // Long task observer
+  // ========================================================================
+
   private initializeLongTaskObserver(): void {
-    if (!supportsPerformanceObserver()) return;
+    if (!supportsLongTaskObserver()) return;
 
     try {
-      const observer = createLongTaskObserver((entries) => {
-        this.handleLongTaskEntries(entries);
+      const observer = new PerformanceObserver((list) => {
+        this.handleLongTaskEntries(list.getEntries());
       });
-      observer.observe({ entryTypes: [PERFORMANCE_ENTRY_TYPE] });
+
+      // Prefer observe({ type, buffered }) when available
+      try {
+        observer.observe(
+          {
+            type: PERFORMANCE_ENTRY_TYPE,
+            buffered: true,
+          } as unknown as PerformanceObserverInit,
+        );
+      } catch {
+        observer.observe({ entryTypes: [PERFORMANCE_ENTRY_TYPE] });
+      }
+
+      this.observer = observer;
     } catch {
-      // Observer not supported or failed to initialize
+      // ignore
     }
   }
 
   private handleLongTaskEntries(entries: PerformanceEntryList): void {
-    const now = performance.now();
-
     for (const entry of entries) {
-      this.recordLongTask(now, entry.duration);
+      // Long task entries have duration + startTime in ms (same time origin as performance.now()).
+      const duration = Number((entry as PerformanceEntry).duration);
+      const startTime = Number((entry as PerformanceEntry).startTime);
+
+      if (!Number.isFinite(duration) || duration <= 0) continue;
+      if (!Number.isFinite(startTime) || startTime < 0) continue;
+
+      const endTime = startTime + duration;
+      this.recordLongTask(endTime, duration);
     }
 
-    this.compactLongTasks(now);
+    this.compactLongTasks(safeNow());
   }
 
-  private recordLongTask(timestamp: number, duration: number): void {
-    this.longTaskTimestamps.push(timestamp);
+  private recordLongTask(endTime: number, duration: number): void {
+    this.longTaskEndTimes.push(endTime);
     this.longTaskDurations.push(duration);
     this.longTaskSumMs += duration;
   }
@@ -124,22 +161,35 @@ export class PressureMonitor {
   private compactLongTasks(now: number): void {
     const windowMs = this.config.longTaskWindowMs;
 
+    // Drop from head while outside window
+    const endTimes = this.longTaskEndTimes;
+    const durations = this.longTaskDurations;
+
     while (
-      this.longTaskTimestamps.length > 0 &&
-      isOutsideWindow(now, this.longTaskTimestamps[0], windowMs)
+      this.longTaskHead < endTimes.length &&
+      isOutsideWindow(now, endTimes[this.longTaskHead], windowMs)
     ) {
-      this.removeFrontLongTask();
+      this.longTaskSumMs -= durations[this.longTaskHead] ?? 0;
+      this.longTaskHead++;
     }
+
+    // Periodic compaction to release memory
+    if (
+      this.longTaskHead > COMPACT_HEAD_THRESHOLD &&
+      this.longTaskHead * COMPACT_RATIO_NUM > endTimes.length
+    ) {
+      this.longTaskEndTimes = endTimes.slice(this.longTaskHead);
+      this.longTaskDurations = durations.slice(this.longTaskHead);
+      this.longTaskHead = 0;
+    }
+
+    // Defensive clamp
+    if (this.longTaskSumMs < 0) this.longTaskSumMs = 0;
   }
 
-  private removeFrontLongTask(): void {
-    const duration = this.longTaskDurations.shift();
-    this.longTaskTimestamps.shift();
-
-    if (duration !== undefined) {
-      this.longTaskSumMs -= duration;
-    }
-  }
+  // ========================================================================
+  // Pressure computation
+  // ========================================================================
 
   private computeCpuPressure(): number {
     const longTaskPressure = this.computeLongTaskPressure();
@@ -167,36 +217,58 @@ export class PressureMonitor {
     const connection = getConnection();
     const saveData = connection?.saveData ?? false;
 
-    if (saveData) {
-      return { netPressure: PRESSURE_MAX, saveData: true };
+    if (saveData) return { netPressure: PRESSURE_MAX, saveData: true };
+
+    const effectiveType =
+      (connection?.effectiveType ?? "") as EffectiveConnectionType;
+    let netPressure = getNetPressureForType(effectiveType);
+
+    // Optional: refine with downlink if present (keep conservative)
+    const downlink = (connection as unknown as { downlink?: number })?.downlink;
+    if (
+      typeof downlink === "number" && Number.isFinite(downlink) && downlink > 0
+    ) {
+      // crude mapping: slower downlink => higher pressure
+      const byDownlink = downlink <= 0.5
+        ? 1.0
+        : downlink <= 1.0
+        ? 0.85
+        : downlink <= 2.0
+        ? 0.55
+        : 0.25;
+      netPressure = Math.max(netPressure, byDownlink);
     }
 
-    const effectiveType = connection?.effectiveType ?? "";
-    const netPressure = getNetPressureForType(effectiveType);
-
-    return { netPressure, saveData };
+    return { netPressure: clampPressure(netPressure), saveData };
   }
 }
 
 // ============================================================================
-// Performance Observer Helpers
+// Observer Support Helpers (SSR-safe)
 // ============================================================================
 
-function supportsPerformanceObserver(): boolean {
-  return "PerformanceObserver" in window;
+function supportsLongTaskObserver(): boolean {
+  if (typeof PerformanceObserver === "undefined") return false;
+  const supported =
+    (PerformanceObserver as unknown as { supportedEntryTypes?: string[] })
+      .supportedEntryTypes;
+  return Array.isArray(supported)
+    ? supported.includes(PERFORMANCE_ENTRY_TYPE)
+    : true;
 }
 
-function createLongTaskObserver(
-  callback: (entries: PerformanceEntryList) => void,
-): PerformanceObserver {
-  return new PerformanceObserver((list) => {
-    callback(list.getEntries());
-  });
-}
+// ============================================================================
+// Time helpers
+// ============================================================================
 
-// ============================================================================
-// Time Window Helpers
-// ============================================================================
+function safeNow(): number {
+  if (
+    typeof performance !== "undefined" && typeof performance.now === "function"
+  ) {
+    return performance.now();
+  }
+  return Date.now();
+}
 
 function isOutsideWindow(
   now: number,
@@ -207,7 +279,7 @@ function isOutsideWindow(
 }
 
 // ============================================================================
-// Network Pressure Helpers
+// Network pressure helpers
 // ============================================================================
 
 function getNetPressureForType(effectiveType: string): number {
@@ -215,7 +287,7 @@ function getNetPressureForType(effectiveType: string): number {
 }
 
 // ============================================================================
-// Utility Helpers
+// Utility helpers
 // ============================================================================
 
 function clampPressure(value: number): number {

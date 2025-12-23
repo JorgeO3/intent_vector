@@ -1,4 +1,3 @@
-// runtime/flightScheduler.ts
 import type {
   IslandHandle,
   IslandKey,
@@ -22,6 +21,8 @@ export type SchedulerConfig = {
   readonly falsePositiveCooldownMs: number;
   readonly assumeReadyDelayMs: number;
   readonly allowEarlyHydrate: boolean;
+  readonly maxAssumeReadyDelayMs: number;
+  readonly dispatchScanLimit: number;
 };
 
 type IslandState =
@@ -30,6 +31,7 @@ type IslandState =
     st: "Prefetching";
     startedTs: number;
     bytes: number;
+    readyDelayMs: number;
     handle: { abort?: () => void } | null;
   }
   | { st: "Prefetched"; readyTs: number; expiresTs: number }
@@ -38,16 +40,15 @@ type IslandState =
 
 type QueueItem = {
   readonly key: IslandKey;
+  readonly typeId: number;
+  readonly flags: number;
+  readonly estBytes: number;
   readonly priority: number;
   readonly tier: 0 | 1;
   readonly reason: string;
 };
 
-type StateTransition = {
-  readonly from: IslandState["st"];
-  readonly to: IslandState["st"];
-  readonly timestamp: number;
-};
+type DispatchResult = "DISPATCHED" | "DEFER_CAPACITY" | "DROP";
 
 // ============================================================================
 // Constants
@@ -56,20 +57,20 @@ type StateTransition = {
 const DEFAULT_CONFIG: SchedulerConfig = {
   maxInflightFetch: 2,
   maxBytesInFlight: 160_000,
-  prefetchTTLms: 2 * 60_000,
+  prefetchTTLms: 120_000, // 2 minutes
   falsePositiveCooldownMs: 15_000,
   assumeReadyDelayMs: 30,
   allowEarlyHydrate: false,
+  maxAssumeReadyDelayMs: 250,
+  dispatchScanLimit: 8,
 } as const;
 
-const PRIORITY_BY_TIER = {
-  HIGH: 2,
-  NORMAL: 1,
-} as const;
-
+const PRIORITY_HIGH = 2;
+const PRIORITY_NORMAL = 1;
 const MAX_QUEUE_SIZE = 32;
 const DEFAULT_ROUTE_ID = "/";
 const MIN_BYTES = 0;
+const DOWNLINK_MBPS_TO_BYTES_PER_MS = 125; // Mbps * 125 = bytes/ms
 
 // ============================================================================
 // Flight Scheduler Class
@@ -81,13 +82,24 @@ export class FlightScheduler {
   private readonly actuators: Actuators;
   private readonly ledger: ReputationLedger;
 
+  // State tracking
   private readonly states = new Map<IslandKey, IslandState>();
+
+  // Queue management (bounded priority queue)
   private readonly queue: QueueItem[] = [];
   private readonly queuedKeys = new Set<IslandKey>();
 
+  // Resource tracking
   private inflightCount = 0;
   private bytesInFlight = 0;
+
+  // Current route
   private routeId = DEFAULT_ROUTE_ID;
+
+  // Cached downlink for adaptive delay estimation
+  private cachedDownlinkBytesPerMs = 0;
+  private lastDownlinkCheckTs = 0;
+  private readonly DOWNLINK_CACHE_MS = 5000; // Re-check every 5s
 
   constructor(
     registry: IslandsRegistry,
@@ -101,6 +113,10 @@ export class FlightScheduler {
     this.config = { ...DEFAULT_CONFIG, ...config };
   }
 
+  // ========================================================================
+  // Public API
+  // ========================================================================
+
   setRouteId(routeId: string): void {
     this.routeId = routeId || DEFAULT_ROUTE_ID;
   }
@@ -110,12 +126,38 @@ export class FlightScheduler {
     this.actuators.setRegistry(registry);
   }
 
-  enqueue(decision: Decision, now = performance.now()): void {
-    if (!shouldEnqueueDecision(decision, this.config)) {
-      return;
-    }
+  /**
+   * Prune inactive islands to prevent unbounded memory growth.
+   * Call after route transitions or periodically.
+   */
+  pruneInactive(
+    activeKeys: ReadonlySet<IslandKey>,
+    now = performance.now(),
+  ): void {
+    const idleTtl = this.config.prefetchTTLms;
 
-    if (decision.action === "PREFETCH" || decision.action === "HYDRATE") {
+    for (const [key, st] of this.states) {
+      if (activeKeys.has(key)) continue;
+
+      // Only prune safe states (never prune in-progress operations)
+      if (st.st === "Idle" && now - st.lastActionTs > idleTtl) {
+        this.states.delete(key);
+        this.queuedKeys.delete(key);
+      }
+    }
+  }
+
+  /**
+   * Enqueue a decision for processing.
+   * Validates and queues prefetch/hydrate targets.
+   */
+  enqueue(decision: Decision, now = performance.now()): void {
+    const action = decision.action;
+
+    if (action === "SKIP") return;
+    if (action === "HYDRATE" && !this.config.allowEarlyHydrate) return;
+
+    if (action === "PREFETCH" || action === "HYDRATE") {
       this.enqueuePrefetchTargets(
         decision.targets,
         decision.tier,
@@ -126,11 +168,19 @@ export class FlightScheduler {
     }
   }
 
+  /**
+   * Main scheduler tick: advance states and dispatch prefetches.
+   * Should be called on RAF or at regular intervals.
+   */
   tick(now = performance.now()): void {
     this.advanceStates(now);
     this.dispatchPrefetches(now);
   }
 
+  /**
+   * Request immediate hydration of an island.
+   * Cancels any in-flight prefetch and executes hydration.
+   */
   async requestHydrate(
     handle: IslandHandle,
     props: unknown,
@@ -140,32 +190,45 @@ export class FlightScheduler {
     const type = this.getIslandType(handle.key);
     if (!type) return;
 
+    // Cancel prefetch to avoid budget leaks
+    this.cancelPrefetchIfActive(handle.key, now);
+
     const state = this.getState(handle.key, now);
     if (isHydrateInProgress(state)) return;
 
     await this.executeHydration(handle, props, now);
   }
 
+  /**
+   * Record a prefetch hit (island was used after prefetch).
+   */
   feedbackHit(key: IslandKey, now = performance.now()): void {
     this.recordFeedback(key, "hit", now);
   }
 
+  /**
+   * Record a prefetch miss (island was prefetched but not used).
+   * Applies cooldown to prevent immediate re-prefetch.
+   */
   feedbackMiss(key: IslandKey, now = performance.now()): void {
     this.cancelPrefetchIfActive(key, now);
     this.transitionToIdleWithCooldown(key, now);
     this.recordFeedback(key, "miss", now);
   }
 
+  /**
+   * Speculative navigation prefetch for nav-like islands.
+   */
   maybeSpeculateNav(handle: IslandHandle, props: unknown): void {
-    if (!isNavigationIsland(handle.key)) return;
+    const decoded = decodeKey(handle.key);
 
-    const type = this.getIslandType(handle.key);
+    if ((decoded.flags & IslandFlags.NavLike) === 0) return;
+
+    const type = this.registry.types[decoded.typeId];
     if (!type) return;
 
-    const url = this.actuators.getNavUrl(decodeKey(handle.key).typeId, props);
-    if (url) {
-      this.actuators.speculatePrefetchUrl(url);
-    }
+    const url = this.actuators.getNavUrl(decoded.typeId, props);
+    if (url) this.actuators.speculatePrefetchUrl(url);
   }
 
   // ========================================================================
@@ -173,12 +236,12 @@ export class FlightScheduler {
   // ========================================================================
 
   private getState(key: IslandKey, now: number): IslandState {
-    const existing = this.states.get(key);
-    if (existing) return existing;
-
-    const initial = createIdleState(now);
-    this.states.set(key, initial);
-    return initial;
+    let state = this.states.get(key);
+    if (!state) {
+      state = createIdleState(now);
+      this.states.set(key, state);
+    }
+    return state;
   }
 
   private setState(key: IslandKey, state: IslandState): void {
@@ -200,44 +263,58 @@ export class FlightScheduler {
     reason: string,
     now: number,
   ): void {
-    const priority = tier === 1
-      ? PRIORITY_BY_TIER.HIGH
-      : PRIORITY_BY_TIER.NORMAL;
+    const priority = tier === 1 ? PRIORITY_HIGH : PRIORITY_NORMAL;
 
     for (const key of targets) {
-      if (this.canEnqueueTarget(key, now)) {
-        this.enqueueTarget(key, priority, tier, reason);
+      const item = this.prepareQueueItem(key, priority, tier, reason, now);
+      if (item) {
+        this.queue.push(item);
+        this.queuedKeys.add(item.key);
       }
     }
 
     this.sortQueueByPriority();
   }
 
-  private canEnqueueTarget(key: IslandKey, now: number): boolean {
-    if (!isPrefetchSafeIsland(key)) return false;
-    if (this.queuedKeys.has(key)) return false;
-
-    const type = this.getIslandType(key);
-    if (!type) return false;
-
-    const state = this.getState(key, now);
-    if (state.st !== "Idle") return false;
-    if (isInCooldown(state, now)) return false;
-
-    return true;
-  }
-
-  private enqueueTarget(
+  private prepareQueueItem(
     key: IslandKey,
     priority: number,
     tier: 0 | 1,
     reason: string,
-  ): void {
-    this.queue.push({ key, priority, tier, reason });
-    this.queuedKeys.add(key);
+    now: number,
+  ): QueueItem | null {
+    // Already queued
+    if (this.queuedKeys.has(key)) return null;
+
+    const decoded = decodeKey(key);
+
+    // Must be prefetch-safe
+    if ((decoded.flags & IslandFlags.PrefetchSafe) === 0) return null;
+
+    const type = this.registry.types[decoded.typeId];
+    if (!type) return null;
+
+    const state = this.getState(key, now);
+
+    // Can only prefetch from idle state (not in cooldown)
+    if (state.st !== "Idle") return null;
+    if (now < state.cooldownUntil) return null;
+
+    const estBytes = Math.max(MIN_BYTES, type.estBytes | 0);
+
+    return {
+      key,
+      typeId: decoded.typeId,
+      flags: decoded.flags,
+      estBytes,
+      priority,
+      tier,
+      reason,
+    };
   }
 
   private sortQueueByPriority(): void {
+    // Stable sort: higher priority first
     this.queue.sort((a, b) => b.priority - a.priority);
   }
 
@@ -256,7 +333,8 @@ export class FlightScheduler {
 
   private advanceStates(now: number): void {
     for (const [key, state] of this.states) {
-      const newState = advanceState(state, now, this.config);
+      const newState = this.advanceState(state, now);
+
       if (newState !== state) {
         this.handleStateTransition(state, newState);
         this.setState(key, newState);
@@ -264,91 +342,171 @@ export class FlightScheduler {
     }
   }
 
-  private handleStateTransition(
-    from: IslandState,
-    to: IslandState,
-  ): void {
-    if (from.st === "Prefetching" && to.st === "Prefetched") {
-      this.releaseFlightResources(from.bytes);
+  private advanceState(state: IslandState, now: number): IslandState {
+    switch (state.st) {
+      case "Prefetching":
+        return this.advancePrefetchingState(state, now);
+      case "Prefetched":
+        return this.advancePrefetchedState(state, now);
+      default:
+        return state;
     }
   }
 
-  private releaseFlightResources(bytes: number): void {
-    this.inflightCount = Math.max(0, this.inflightCount - 1);
-    this.bytesInFlight = Math.max(0, this.bytesInFlight - bytes);
+  private advancePrefetchingState(
+    state: Extract<IslandState, { st: "Prefetching" }>,
+    now: number,
+  ): IslandState {
+    const elapsed = now - state.startedTs;
+    const readyThreshold = Math.max(
+      this.config.assumeReadyDelayMs,
+      state.readyDelayMs,
+    );
+
+    if (elapsed >= readyThreshold) {
+      const expiresTs = now + this.config.prefetchTTLms;
+      return createPrefetchedState(now, expiresTs);
+    }
+
+    return state;
+  }
+
+  private advancePrefetchedState(
+    state: Extract<IslandState, { st: "Prefetched" }>,
+    now: number,
+  ): IslandState {
+    if (now >= state.expiresTs) {
+      return createIdleState(now);
+    }
+    return state;
+  }
+
+  private handleStateTransition(from: IslandState, to: IslandState): void {
+    // Release budgets when Prefetching -> Prefetched naturally completes
+    if (from.st === "Prefetching" && to.st === "Prefetched") {
+      this.releaseFlightResources(from.bytes);
+    }
   }
 
   // ========================================================================
   // Private - Prefetch Dispatch
   // ========================================================================
 
+  /**
+   * Dispatch prefetches respecting capacity constraints.
+   * Scans queue window to avoid HOL blocking and drops invalid items.
+   */
   private dispatchPrefetches(now: number): void {
-    while (this.queue.length > 0 && this.canDispatchMore()) {
-      const item = this.dequeueNext();
-      if (!item) break;
+    const scanLimit = Math.max(1, this.config.dispatchScanLimit | 0);
 
-      const dispatched = this.tryDispatchPrefetch(item, now);
-      if (!dispatched) {
-        this.requeueItem(item);
+    while (this.queue.length > 0 && this.hasCapacity()) {
+      const windowSize = Math.min(this.queue.length, scanLimit);
+      let dispatched = false;
+
+      for (let i = 0; i < windowSize; i++) {
+        const item = this.queue[i];
+        const eligibility = this.checkEligibility(item, now);
+
+        if (eligibility === "DROP") {
+          // Remove invalid item
+          this.removeQueueItemAt(i);
+          dispatched = true;
+          i--; // Adjust index after removal
+          continue;
+        }
+
+        if (eligibility === "DEFER_CAPACITY") {
+          // Not enough capacity for this item, try next
+          continue;
+        }
+
+        // DISPATCHED: execute and remove from queue
+        this.removeQueueItemAt(i);
+        const result = this.tryDispatchPrefetch(item, now);
+
+        if (result === "DEFER_CAPACITY") {
+          // Requeue to front if capacity was limiting
+          this.requeueToFront(item);
+          return;
+        }
+
+        dispatched = true;
         break;
       }
+
+      // No progress means capacity is limiting
+      if (!dispatched) break;
     }
   }
 
-  private canDispatchMore(): boolean {
-    return (
-      this.inflightCount < this.config.maxInflightFetch &&
-      this.bytesInFlight < this.config.maxBytesInFlight
-    );
+  private checkEligibility(item: QueueItem, now: number): DispatchResult {
+    // Validate prefetch-safe flag
+    if ((item.flags & IslandFlags.PrefetchSafe) === 0) return "DROP";
+
+    // Validate type still exists
+    const type = this.registry.types[item.typeId];
+    if (!type) return "DROP";
+
+    // Validate state allows prefetch
+    const state = this.getState(item.key, now);
+    if (!this.canPrefetchFromState(state, now)) return "DROP";
+
+    // Check capacity
+    const bytes = Math.max(MIN_BYTES, type.estBytes | 0);
+    if (!this.hasCapacityForBytes(bytes)) return "DEFER_CAPACITY";
+
+    return "DISPATCHED";
   }
 
-  private dequeueNext(): QueueItem | null {
-    const item = this.queue.shift();
-    if (item) {
-      this.queuedKeys.delete(item.key);
-    }
-    return item ?? null;
+  private canPrefetchFromState(state: IslandState, now: number): boolean {
+    return state.st === "Idle" && now >= state.cooldownUntil;
   }
 
-  private requeueItem(item: QueueItem): void {
-    this.queue.unshift(item);
-    this.queuedKeys.add(item.key);
-  }
-
-  private tryDispatchPrefetch(item: QueueItem, now: number): boolean {
-    const type = this.getIslandType(item.key);
-    if (!type) return false;
+  private tryDispatchPrefetch(item: QueueItem, now: number): DispatchResult {
+    const type = this.registry.types[item.typeId];
+    if (!type) return "DROP";
 
     const state = this.getState(item.key, now);
-    if (!canPrefetchFromState(state, item.key, now)) return false;
+    if (!this.canPrefetchFromState(state, now)) return "DROP";
 
     const bytes = Math.max(MIN_BYTES, type.estBytes | 0);
-    if (!this.hasCapacityFor(bytes)) return false;
+    if (!this.hasCapacityForBytes(bytes)) return "DEFER_CAPACITY";
 
-    this.executePrefetch(item.key, type, bytes, now);
-    return true;
-  }
-
-  private hasCapacityFor(bytes: number): boolean {
-    return this.bytesInFlight + bytes <= this.config.maxBytesInFlight;
+    const success = this.executePrefetch(
+      item.key,
+      item.flags,
+      type,
+      bytes,
+      now,
+    );
+    return success ? "DISPATCHED" : "DEFER_CAPACITY";
   }
 
   private executePrefetch(
     key: IslandKey,
+    flags: number,
     type: IslandTypeDef,
     bytes: number,
     now: number,
-  ): void {
-    const { flags } = decodeKey(key);
-    const handle = this.actuators.prefetch(type, flags);
+  ): boolean {
+    const readyDelayMs = this.estimateReadyDelay(bytes, now);
 
+    let handle: { abort?: () => void } | null = null;
+    try {
+      handle = this.actuators.prefetch(type, flags);
+    } catch {
+      // Prefetch failed; don't allocate budgets
+      return false;
+    }
+
+    // Allocate budgets and transition to Prefetching
     this.allocateFlightResources(bytes);
-    this.setState(key, createPrefetchingState(now, bytes, handle));
-  }
+    this.setState(
+      key,
+      createPrefetchingState(now, bytes, readyDelayMs, handle),
+    );
 
-  private allocateFlightResources(bytes: number): void {
-    this.inflightCount++;
-    this.bytesInFlight += bytes;
+    return true;
   }
 
   // ========================================================================
@@ -383,7 +541,49 @@ export class FlightScheduler {
   }
 
   // ========================================================================
-  // Private - Feedback & Cancellation
+  // Private - Resource Management
+  // ========================================================================
+
+  private hasCapacity(): boolean {
+    return (
+      this.inflightCount < this.config.maxInflightFetch &&
+      this.bytesInFlight < this.config.maxBytesInFlight
+    );
+  }
+
+  private hasCapacityForBytes(bytes: number): boolean {
+    return this.bytesInFlight + bytes <= this.config.maxBytesInFlight;
+  }
+
+  private allocateFlightResources(bytes: number): void {
+    this.inflightCount++;
+    this.bytesInFlight += bytes;
+  }
+
+  private releaseFlightResources(bytes: number): void {
+    this.inflightCount = Math.max(0, this.inflightCount - 1);
+    this.bytesInFlight = Math.max(0, this.bytesInFlight - bytes);
+  }
+
+  // ========================================================================
+  // Private - Queue Operations
+  // ========================================================================
+
+  private removeQueueItemAt(index: number): void {
+    const [removed] = this.queue.splice(index, 1);
+    if (removed) this.queuedKeys.delete(removed.key);
+  }
+
+  private requeueToFront(item: QueueItem): void {
+    if (this.queuedKeys.has(item.key)) return;
+
+    this.queue.unshift(item);
+    this.queuedKeys.add(item.key);
+    this.compactQueue();
+  }
+
+  // ========================================================================
+  // Private - Cancellation & Feedback
   // ========================================================================
 
   private cancelPrefetchIfActive(key: IslandKey, now: number): void {
@@ -392,6 +592,7 @@ export class FlightScheduler {
     if (state.st === "Prefetching") {
       this.abortPrefetch(state.handle);
       this.releaseFlightResources(state.bytes);
+      this.setState(key, createIdleState(now));
     }
   }
 
@@ -424,6 +625,26 @@ export class FlightScheduler {
       this.ledger.recordMiss(this.routeId, islandId, now);
     }
   }
+
+  // ========================================================================
+  // Private - Adaptive Delay Estimation
+  // ========================================================================
+
+  private estimateReadyDelay(bytes: number, now: number): number {
+    const base = this.config.assumeReadyDelayMs;
+    const max = this.config.maxAssumeReadyDelayMs;
+
+    // Update cached downlink periodically
+    if (now - this.lastDownlinkCheckTs > this.DOWNLINK_CACHE_MS) {
+      this.cachedDownlinkBytesPerMs = getDownlinkBytesPerMs();
+      this.lastDownlinkCheckTs = now;
+    }
+
+    if (this.cachedDownlinkBytesPerMs <= 0) return base;
+
+    const estimatedMs = bytes / this.cachedDownlinkBytesPerMs;
+    return clampRange(estimatedMs, base, max);
+  }
 }
 
 // ============================================================================
@@ -431,22 +652,20 @@ export class FlightScheduler {
 // ============================================================================
 
 function createIdleState(timestamp: number): IslandState {
-  return {
-    st: "Idle",
-    lastActionTs: timestamp,
-    cooldownUntil: 0,
-  };
+  return { st: "Idle", lastActionTs: timestamp, cooldownUntil: 0 };
 }
 
 function createPrefetchingState(
   timestamp: number,
   bytes: number,
+  readyDelayMs: number,
   handle: { abort?: () => void } | null,
 ): IslandState {
   return {
     st: "Prefetching",
     startedTs: timestamp,
     bytes,
+    readyDelayMs,
     handle,
   };
 }
@@ -455,25 +674,15 @@ function createPrefetchedState(
   readyTs: number,
   expiresTs: number,
 ): IslandState {
-  return {
-    st: "Prefetched",
-    readyTs,
-    expiresTs,
-  };
+  return { st: "Prefetched", readyTs, expiresTs };
 }
 
 function createHydratingState(timestamp: number): IslandState {
-  return {
-    st: "Hydrating",
-    startedTs: timestamp,
-  };
+  return { st: "Hydrating", startedTs: timestamp };
 }
 
 function createHydratedState(timestamp: number): IslandState {
-  return {
-    st: "Hydrated",
-    readyTs: timestamp,
-  };
+  return { st: "Hydrated", readyTs: timestamp };
 }
 
 // ============================================================================
@@ -484,97 +693,31 @@ function isHydrateInProgress(state: IslandState): boolean {
   return state.st === "Hydrated" || state.st === "Hydrating";
 }
 
-function isInCooldown(state: IslandState, now: number): boolean {
-  return state.st === "Idle" && now < state.cooldownUntil;
-}
-
-function canPrefetchFromState(
-  state: IslandState,
-  key: IslandKey,
-  now: number,
-): boolean {
-  if (state.st !== "Idle") return false;
-  if (isInCooldown(state, now)) return false;
-  if (!isPrefetchSafeIsland(key)) return false;
-  return true;
-}
-
 // ============================================================================
-// State Advancement
+// Network Helpers
 // ============================================================================
 
-function advanceState(
-  state: IslandState,
-  now: number,
-  config: SchedulerConfig,
-): IslandState {
-  if (state.st === "Prefetching") {
-    return advancePrefetchingState(state, now, config);
+function getDownlinkBytesPerMs(): number {
+  const nav = globalThis.navigator as unknown as
+    | { connection?: { downlink?: number } }
+    | undefined;
+
+  const mbps = nav?.connection?.downlink;
+
+  if (typeof mbps === "number" && mbps > 0) {
+    return mbps * DOWNLINK_MBPS_TO_BYTES_PER_MS;
   }
 
-  if (state.st === "Prefetched") {
-    return advancePrefetchedState(state, now);
-  }
-
-  return state;
+  return 0;
 }
 
-function advancePrefetchingState(
-  state: Extract<IslandState, { st: "Prefetching" }>,
-  now: number,
-  config: SchedulerConfig,
-): IslandState {
-  const elapsed = now - state.startedTs;
-
-  if (elapsed >= config.assumeReadyDelayMs) {
-    const expiresTs = now + config.prefetchTTLms;
-    return createPrefetchedState(now, expiresTs);
-  }
-
-  return state;
-}
-
-function advancePrefetchedState(
-  state: Extract<IslandState, { st: "Prefetched" }>,
-  now: number,
-): IslandState {
-  if (now >= state.expiresTs) {
-    return createIdleState(now);
-  }
-
-  return state;
-}
-
-// ============================================================================
-// Decision Helpers
-// ============================================================================
-
-function shouldEnqueueDecision(
-  decision: Decision,
-  config: SchedulerConfig,
-): boolean {
-  if (decision.action === "SKIP") return false;
-
-  if (decision.action === "HYDRATE") {
-    return config.allowEarlyHydrate;
-  }
-
-  return true;
+function clampRange(x: number, min: number, max: number): number {
+  return x < min ? min : x > max ? max : x;
 }
 
 // ============================================================================
 // Island Helpers
 // ============================================================================
-
-function isPrefetchSafeIsland(key: IslandKey): boolean {
-  const { flags } = decodeKey(key);
-  return (flags & IslandFlags.PrefetchSafe) !== 0;
-}
-
-function isNavigationIsland(key: IslandKey): boolean {
-  const { flags } = decodeKey(key);
-  return (flags & IslandFlags.NavLike) !== 0;
-}
 
 function createIslandId(key: IslandKey): string {
   return key.toString(36);

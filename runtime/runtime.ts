@@ -1,4 +1,3 @@
-// runtime/intentFirstRuntime.ts
 import { IntentVector } from "../intent/intentVector.ts";
 import { loadPropsPool, loadRegistry } from "./islandManifest.ts";
 import { IslandLocator } from "./islandLocator.ts";
@@ -10,6 +9,7 @@ import { Actuators } from "./actuators.ts";
 import { FlightScheduler } from "./flightScheduler.ts";
 
 import type {
+  Candidate,
   IslandHandle,
   IslandKey,
   IslandsRegistry,
@@ -31,8 +31,8 @@ export type RuntimeConfig = {
   readonly captureInput: boolean;
   readonly captureSubmit: boolean;
   readonly captureFocus: boolean;
-  readonly islandSelector: string;
-  readonly tokenAttr: string;
+  readonly islandSelector: string; // must match IslandLocator scan selector
+  readonly tokenAttr: string; // dataset attr holding token (base36)
   readonly debugPropsDatasetKey: string;
 };
 
@@ -87,12 +87,19 @@ const EVENT_TYPES = {
   CHANGE: "change",
   SUBMIT: "submit",
   FOCUS_IN: "focusin",
+  SCROLL: "scroll",
+  RESIZE: "resize",
+  POPSTATE: "popstate",
 } as const;
 
 const EVENT_OPTIONS = {
   PASSIVE_CAPTURE: { capture: true, passive: true } as const,
   CAPTURE_ONLY: { capture: true } as const,
+  PASSIVE: { passive: true } as const,
 };
+
+// throttle for layout work
+const MIN_LAYOUT_UPDATE_INTERVAL_MS = 32;
 
 // ============================================================================
 // Intent First Runtime Class
@@ -115,13 +122,28 @@ export class IntentFirstRuntime {
   private readonly actuators: Actuators;
   private readonly scheduler: FlightScheduler;
 
+  // pointer state
   private pointerX = 0;
   private pointerY = 0;
+
+  // frame state
   private lastTimestamp = 0;
   private frameCount = 0;
 
+  // cached candidates (avoid alloc per frame)
+  private candidatesCache: Candidate[] = [];
+
+  // layout / DOM dirtiness
+  private rectsDirty = true;
+  private domDirty = true;
+  private lastLayoutUpdateTs = 0;
+
+  // route tracking
+  private lastRouteId = DEFAULT_ROUTE_ID;
+
   private running = false;
   private readonly cleanupCallbacks: EventListenerCleanup[] = [];
+  private mutationObserver: MutationObserver | null = null;
 
   constructor(config?: Partial<RuntimeConfig>, hooks?: RuntimeHooks) {
     this.config = { ...DEFAULT_CONFIG, ...config };
@@ -145,7 +167,8 @@ export class IntentFirstRuntime {
       this.ledger,
     );
 
-    this.scheduler.setRouteId(getCurrentRouteId());
+    this.lastRouteId = getCurrentRouteId();
+    this.scheduler.setRouteId(this.lastRouteId);
   }
 
   start(): void {
@@ -154,7 +177,11 @@ export class IntentFirstRuntime {
 
     this.setupPointerTracking();
     this.setupEventDelegation();
+    this.setupLayoutTracking();
+    this.setupRouteTracking();
+
     this.initializeState();
+    this.rescanIslands(); // important: build handles + candidates cache
 
     if (this.config.useRAF) {
       this.startAnimationLoop();
@@ -164,12 +191,14 @@ export class IntentFirstRuntime {
   stop(): void {
     this.running = false;
     this.cleanupEventListeners();
+    this.teardownObservers();
   }
 
   refresh(): void {
-    this.refreshLocator();
     this.reloadManifest();
     this.updateDependencies();
+    this.rescanIslands();
+    this.syncRouteId();
   }
 
   // ========================================================================
@@ -179,13 +208,7 @@ export class IntentFirstRuntime {
   private initializeState(): void {
     const now = performance.now();
     this.lastTimestamp = now;
-    this.resetCoreIfAvailable(this.pointerX, this.pointerY);
-  }
-
-  private resetCoreIfAvailable(x: number, y: number): void {
-    if (hasResetMethod(this.core)) {
-      this.core.reset(x, y);
-    }
+    this.core.reset(this.pointerX, this.pointerY);
   }
 
   // ========================================================================
@@ -193,10 +216,11 @@ export class IntentFirstRuntime {
   // ========================================================================
 
   private setupPointerTracking(): void {
-    const handlePointerMove = (event: Event) => {
+    const onMove = (event: Event) => {
       if (!(event instanceof PointerEvent)) return;
 
-      this.updatePointerPosition(event.clientX, event.clientY);
+      this.pointerX = event.clientX;
+      this.pointerY = event.clientY;
 
       if (!this.config.useRAF) {
         this.tick(performance.now());
@@ -205,14 +229,9 @@ export class IntentFirstRuntime {
 
     this.addGlobalListener(
       EVENT_TYPES.POINTER_MOVE,
-      handlePointerMove,
+      onMove,
       EVENT_OPTIONS.PASSIVE_CAPTURE,
     );
-  }
-
-  private updatePointerPosition(x: number, y: number): void {
-    this.pointerX = x;
-    this.pointerY = y;
   }
 
   // ========================================================================
@@ -220,7 +239,10 @@ export class IntentFirstRuntime {
   // ========================================================================
 
   private setupEventDelegation(): void {
-    const handler = (event: Event) => this.handleUserEvent(event);
+    const handler = (event: Event) => {
+      // fire-and-forget: hydration is async, do not block the event
+      void this.handleUserEvent(event);
+    };
 
     if (this.config.capturePointerDown) {
       this.addGlobalListener(
@@ -285,10 +307,124 @@ export class IntentFirstRuntime {
   }
 
   private cleanupEventListeners(): void {
-    for (const cleanup of this.cleanupCallbacks) {
-      cleanup();
-    }
+    for (const cleanup of this.cleanupCallbacks) cleanup();
     this.cleanupCallbacks.length = 0;
+  }
+
+  private teardownObservers(): void {
+    try {
+      this.mutationObserver?.disconnect();
+    } catch {
+      // ignore
+    }
+    this.mutationObserver = null;
+
+    // optional (if your PressureMonitor has dispose())
+    try {
+      (this.pressure as unknown as { dispose?: () => void }).dispose?.();
+    } catch {
+      // ignore
+    }
+  }
+
+  // ========================================================================
+  // Private - Layout / DOM tracking
+  // ========================================================================
+
+  private setupLayoutTracking(): void {
+    const markRectsDirty = () => {
+      this.rectsDirty = true;
+      if (!this.config.useRAF) this.tick(performance.now());
+    };
+
+    const markDomDirty = () => {
+      this.domDirty = true;
+      this.rectsDirty = true;
+      if (!this.config.useRAF) this.tick(performance.now());
+    };
+
+    this.addGlobalListener(
+      EVENT_TYPES.SCROLL,
+      markRectsDirty,
+      EVENT_OPTIONS.PASSIVE,
+    );
+    this.addGlobalListener(
+      EVENT_TYPES.RESIZE,
+      markRectsDirty,
+      EVENT_OPTIONS.PASSIVE,
+    );
+
+    if (typeof MutationObserver !== "undefined") {
+      const root = document.body ?? document.documentElement;
+      if (root) {
+        const observer = new MutationObserver(markDomDirty);
+        observer.observe(root, {
+          childList: true,
+          subtree: true,
+          attributes: true,
+        });
+        this.mutationObserver = observer;
+      }
+    }
+  }
+
+  private maybeUpdateLayout(now: number): void {
+    if (!this.domDirty && !this.rectsDirty) return;
+
+    // throttle expensive layout work
+    if (now - this.lastLayoutUpdateTs < MIN_LAYOUT_UPDATE_INTERVAL_MS) return;
+    this.lastLayoutUpdateTs = now;
+
+    if (this.domDirty) {
+      this.rescanIslands();
+      this.domDirty = false;
+      this.rectsDirty = false;
+      return;
+    }
+
+    if (this.rectsDirty) {
+      this.updateRectsInPlace();
+      this.rectsDirty = false;
+    }
+  }
+
+  private rescanIslands(): void {
+    const handles = this.locator.scan(document);
+    // Build stable candidates cache once per scan
+    this.candidatesCache = handles.map((h) => ({ key: h.key, rect: h.rect }));
+    // Ensure rect objects remain stable afterwards (we mutate in place)
+    this.updateRectsInPlace();
+  }
+
+  private updateRectsInPlace(): void {
+    const handles = this.locator.getAllHandles();
+
+    for (const handle of handles) {
+      const bounds = handle.el.getBoundingClientRect();
+      // mutate the same Rect object to preserve references held by candidatesCache
+      const r = handle.rect;
+      r.x = bounds.left;
+      r.y = bounds.top;
+      r.w = bounds.width;
+      r.h = bounds.height;
+    }
+  }
+
+  // ========================================================================
+  // Private - Route tracking
+  // ========================================================================
+
+  private setupRouteTracking(): void {
+    const onPop = () => this.syncRouteId();
+    this.addGlobalListener(EVENT_TYPES.POPSTATE, onPop, EVENT_OPTIONS.PASSIVE);
+  }
+
+  private syncRouteId(): void {
+    const routeId = getCurrentRouteId();
+    if (routeId !== this.lastRouteId) {
+      this.lastRouteId = routeId;
+      this.scheduler.setRouteId(routeId);
+    }
   }
 
   // ========================================================================
@@ -297,7 +433,7 @@ export class IntentFirstRuntime {
 
   private async handleUserEvent(event: Event): Promise<void> {
     const target = event.target;
-    if (!isHTMLElement(target)) return;
+    if (!(target instanceof HTMLElement)) return;
 
     const islandElement = findClosestIsland(target, this.config.islandSelector);
     if (!islandElement) return;
@@ -305,43 +441,19 @@ export class IntentFirstRuntime {
     const handle = this.createHandleFromElement(islandElement);
     if (!handle) return;
 
-    await this.hydrateIsland(handle, event.type);
-  }
-
-  private async hydrateIsland(
-    handle: IslandHandle,
-    eventType: string,
-  ): Promise<void> {
     const props = this.resolveIslandProps(handle);
-    const reason = `event:${eventType}`;
+    const reason = `event:${event.type}`;
 
     try {
       await this.scheduler.requestHydrate(handle, props, reason);
-      this.notifyHydrationSuccess(handle, props, reason);
+      this.hooks.onHydrated?.({ key: handle.key, handle, props, reason });
     } catch (error) {
-      this.notifyHydrationError(error);
+      this.hooks.onError?.(error);
     }
   }
 
-  private notifyHydrationSuccess(
-    handle: IslandHandle,
-    props: unknown,
-    reason: string,
-  ): void {
-    this.hooks.onHydrated?.({
-      key: handle.key,
-      handle,
-      props,
-      reason,
-    });
-  }
-
-  private notifyHydrationError(error: unknown): void {
-    this.hooks.onError?.(error);
-  }
-
   // ========================================================================
-  // Private - Island Handle Creation
+  // Private - Island Handle Creation (reuse scanned handle when possible)
   // ========================================================================
 
   private createHandleFromElement(element: HTMLElement): IslandHandle | null {
@@ -350,6 +462,9 @@ export class IntentFirstRuntime {
 
     const key = parseIslandKey(token);
     if (!key) return null;
+
+    const existing = this.locator.getHandle(key);
+    if (existing) return existing;
 
     const decoded = decodeKey(key);
     const rect = computeElementRect(element);
@@ -373,17 +488,9 @@ export class IntentFirstRuntime {
       return this.hooks.resolveProps(handle, this.propsPool);
     }
 
-    return this.resolvePropsDefault(handle);
-  }
-
-  private resolvePropsDefault(handle: IslandHandle): unknown {
     const poolProps = this.propsPool[handle.propsId];
     if (poolProps !== undefined) return poolProps;
 
-    return this.resolvePropsFromDataset(handle);
-  }
-
-  private resolvePropsFromDataset(handle: IslandHandle): unknown {
     const datasetKey = this.config.debugPropsDatasetKey;
     const rawJson = handle.el.dataset[datasetKey];
     return parseJsonSafely(rawJson);
@@ -396,7 +503,6 @@ export class IntentFirstRuntime {
   private startAnimationLoop(): void {
     const animate = (timestamp: number) => {
       if (!this.running) return;
-
       this.tick(timestamp);
       requestAnimationFrame(animate);
     };
@@ -410,34 +516,25 @@ export class IntentFirstRuntime {
     const deltaTime = this.computeDeltaTime(timestamp);
     this.lastTimestamp = timestamp;
 
-    this.updateIntentVector(deltaTime);
-    this.processFrame(timestamp);
+    this.maybeUpdateLayout(timestamp);
+
+    this.core.update(this.pointerX, this.pointerY, deltaTime);
+
+    // selection uses deltaTime in ms (correctness fix)
+    const selection = this.lock.select(this.candidatesCache, deltaTime);
+
+    this.frameCount++;
+    if (this.shouldRunPolicy()) {
+      this.runPolicy(selection, timestamp);
+    }
 
     const endTime = performance.now();
-    this.updatePressureMetrics(endTime - startTime);
+    this.pressure.setLastEngineCostMs(endTime - startTime);
   }
 
   private computeDeltaTime(timestamp: number): number {
     const raw = timestamp - this.lastTimestamp;
     return clamp(raw, MIN_DELTA_TIME, MAX_DELTA_TIME);
-  }
-
-  private updateIntentVector(deltaTime: number): void {
-    this.core.update(this.pointerX, this.pointerY, deltaTime);
-  }
-
-  private processFrame(timestamp: number): void {
-    const candidates = this.locator.candidates();
-    const selection = this.lock.select(
-      candidates,
-      timestamp - this.lastTimestamp,
-    );
-
-    this.frameCount++;
-
-    if (this.shouldRunPolicy()) {
-      this.runPolicy(selection, timestamp);
-    }
   }
 
   private shouldRunPolicy(): boolean {
@@ -449,34 +546,24 @@ export class IntentFirstRuntime {
     selection: ReturnType<TargetLock["select"]>,
     timestamp: number,
   ): void {
-    const pressure = this.pressure.read();
-    const routeId = getCurrentRouteId();
+    this.syncRouteId();
 
+    const pressure = this.pressure.read();
     const decision = this.policy.decide(
       selection,
       this.registry,
       pressure,
       this.ledger,
-      routeId,
+      this.lastRouteId,
     );
 
     this.scheduler.enqueue(decision, timestamp);
     this.scheduler.tick(timestamp);
   }
 
-  private updatePressureMetrics(engineCostMs: number): void {
-    this.pressure.setLastEngineCostMs(engineCostMs);
-  }
-
   // ========================================================================
   // Private - Refresh & Updates
   // ========================================================================
-
-  private refreshLocator(): void {
-    if (hasRefreshMethod(this.locator)) {
-      this.locator.refresh();
-    }
-  }
 
   private reloadManifest(): void {
     this.registry = loadRegistry();
@@ -496,11 +583,9 @@ export class IntentFirstRuntime {
 function getCurrentRouteId(): string {
   const globals = globalThis as GlobalWithLocation;
   const pathname = globals.location?.pathname;
-  return typeof pathname === "string" ? pathname : DEFAULT_ROUTE_ID;
-}
-
-function isHTMLElement(target: EventTarget | null): target is HTMLElement {
-  return target instanceof HTMLElement;
+  return typeof pathname === "string" && pathname.length
+    ? pathname
+    : DEFAULT_ROUTE_ID;
 }
 
 function findClosestIsland(
@@ -512,44 +597,14 @@ function findClosestIsland(
 
 function computeElementRect(element: HTMLElement): Rect {
   const bounds = element.getBoundingClientRect();
-  return {
-    x: bounds.left,
-    y: bounds.top,
-    w: bounds.width,
-    h: bounds.height,
-  };
+  return { x: bounds.left, y: bounds.top, w: bounds.width, h: bounds.height };
 }
 
 function parseJsonSafely(json: string | undefined): unknown {
   if (!json) return null;
-
   try {
     return JSON.parse(json) as unknown;
   } catch {
     return null;
   }
-}
-
-// ============================================================================
-// Type Guards for Optional Methods
-// ============================================================================
-
-function hasResetMethod(
-  obj: unknown,
-): obj is { reset: (x: number, y: number) => void } {
-  return (
-    typeof obj === "object" &&
-    obj !== null &&
-    "reset" in obj &&
-    typeof (obj as { reset: unknown }).reset === "function"
-  );
-}
-
-function hasRefreshMethod(obj: unknown): obj is { refresh: () => void } {
-  return (
-    typeof obj === "object" &&
-    obj !== null &&
-    "refresh" in obj &&
-    typeof (obj as { refresh: unknown }).refresh === "function"
-  );
 }
