@@ -1,3 +1,5 @@
+import type { PrefetchHandle } from "./actuators.ts";
+
 export type Rect = { x: number; y: number; w: number; h: number };
 
 export type IslandKey = number; // packed token numeric identity
@@ -85,13 +87,68 @@ export type Selection = {
   top: ScoredTarget[];
 };
 
-export type NetworkInformation = {
-  effectiveType?: "slow-2g" | "2g" | "3g" | "4g";
-  rtt?: number;
-  downlink?: number;
-  saveData?: boolean;
+// Re-export from utils for backward compatibility
+export type {
+  NavigatorWithConnectionAPI as NavigatorWithConnection,
+  NetworkInformationConnection as NetworkInformation,
+} from "./utils.ts";
+
+// ============================================================================
+// Shared Config Types
+// ============================================================================
+
+export type LedgerConfig = {
+  readonly emaAlpha: number;
+  readonly minPrior: number;
+  readonly maxPrior: number;
 };
 
-export type NavigatorWithConnection = Navigator & {
-  connection?: NetworkInformation;
+export type PressureConfig = {
+  readonly longTaskWindowMs: number;
+  readonly longTaskBudgetMs: number;
 };
+
+export type SchedulerConfig = {
+  readonly maxInflightFetch: number;
+  readonly maxBytesInFlight: number;
+  readonly prefetchTTLms: number;
+  readonly falsePositiveCooldownMs: number;
+  readonly assumeReadyDelayMs: number;
+  readonly allowEarlyHydrate: boolean;
+  readonly maxAssumeReadyDelayMs: number;
+  readonly dispatchScanLimit: number;
+};
+
+export type ActuatorConfig = {
+  readonly useModulePreload: boolean;
+  readonly useFetchPrefetch: boolean;
+};
+
+// ============================================================================
+// Shared Geometry & Math Types
+// ============================================================================
+
+export type DerivedConfig = {
+  readonly [key: string]: number | boolean;
+};
+
+// ============================================================================
+// State Types - Numeric IDs for bundle size & comparison speed
+// ============================================================================
+
+/** Numeric state IDs (faster comparisons, smaller bundle than string literals) */
+export const enum IslandSt {
+  Idle = 0,
+  Prefetching = 1,
+  Prefetched = 2,
+  Hydrating = 3,
+  Hydrated = 4,
+}
+
+// deno-fmt-ignore
+export type IslandState =
+  | { st: IslandSt.Idle; lastActionTs: number; cooldownUntil: number }
+  | { st: IslandSt.Prefetching; startedTs: number; bytes: number; readyDelayMs: number; handle: PrefetchHandle | null }
+  | { st: IslandSt.Prefetched; readyTs: number; expiresTs: number }
+  | { st: IslandSt.Hydrating; startedTs: number }
+  | { st: IslandSt.Hydrated; readyTs: number };

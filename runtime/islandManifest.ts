@@ -18,14 +18,14 @@ const GLOBAL_KEYS = {
 
 const DEFAULT_VERSION = 1;
 
-const DEFAULT_TYPE_CONFIG: Readonly<IslandTypeDefDefaults> = Object.freeze({
+const DEFAULT_TYPE_CONFIG: Readonly<IslandTypeDefDefaults> = {
   kind: "component",
   exportName: "hydrate",
   defaultFlags: IslandFlags.PrefetchSafe | IslandFlags.HydrateOnEventOnly,
   estBytes: 25_000,
   estCpuMs: 4.0,
   estBenefitMs: 90,
-});
+} as const;
 
 // ============================================================================
 // Type Definitions

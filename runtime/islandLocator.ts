@@ -35,6 +35,14 @@ export type RectUpdateOptions = {
   readonly skipDisconnected?: boolean;
 };
 
+export type SpatialQueryOptions = {
+  /**
+   * Search radius in pixels from the query point.
+   * Default uses GRID_CELL_SIZE * sqrt(2) to cover 3x3 grid cells.
+   */
+  readonly radius?: number;
+};
+
 // ============================================================================
 // Constants
 // ============================================================================
@@ -45,23 +53,34 @@ const ZERO_RECT: Readonly<Rect> = Object.freeze({ x: 0, y: 0, w: 0, h: 0 });
 const DEFAULT_VISIBILITY_ROOT_MARGIN = "256px";
 const VISIBILITY_THRESHOLD = 0;
 
+// Spatial Grid: 400px cells cover reasonable interaction area
+// sqrt(2) * 400 ≈ 565px diagonal reach with 3x3 query
+const GRID_CELL_SIZE = 400;
+const GRID_QUERY_RADIUS = 1; // Query 3x3 grid (center ± 1)
+
 // ============================================================================
-// Island Locator
+// Island Locator - High Performance Spatial Index
 // ============================================================================
 
 export class IslandLocator {
   private handles: IslandHandle[] = [];
   private readonly handlesByKey = new Map<IslandKey, IslandHandle>();
 
-  // Candidate cache to avoid per-call allocations
-  private candidatesCache: Candidate[] = [];
+  // Spatial Grid: Maps cell hash → array of island keys
+  // Hash formula: (cellY << 16) | cellX (32-bit integer)
+  private readonly spatialGrid = new Map<number, IslandKey[]>();
+
+  // Reusable arrays to minimize GC pressure
+  private readonly candidatesCache: Candidate[] = [];
+  private readonly queryResultCache: Candidate[] = [];
+  private readonly seenKeysCache = new Set<IslandKey>();
 
   // Optional visibility tracking (IntersectionObserver)
   private io: IntersectionObserver | null = null;
   private readonly visibleKeys = new Set<IslandKey>();
 
   /**
-   * Scans the DOM for island elements and creates handles.
+   * Scans the DOM for island elements and builds spatial index.
    * @param root - The root node to scan. Defaults to document.
    * @param options - Scan configuration options.
    * @returns Readonly array of island handles found.
@@ -87,15 +106,16 @@ export class IslandLocator {
     );
 
     this.handles = handles;
-
-    // Keep candidate cache aligned
     this.ensureCandidateCacheSize(handles.length);
+
+    // Build spatial index for O(1) queries
+    this.rebuildSpatialGrid();
 
     return this.handles;
   }
 
   /**
-   * Updates bounding rectangles for island handles.
+   * Updates bounding rectangles and rebuilds spatial index.
    * WARNING: Can force layout reflow if applied to many elements.
    * Prefer calling on scroll/resize/mutation, or only for visible keys.
    * @param options - Update configuration options.
@@ -104,19 +124,83 @@ export class IslandLocator {
     const { keys, skipDisconnected = true } = options;
 
     if (!keys) {
-      // Update all handles
       this.updateAllRects(skipDisconnected);
-      return;
+    } else {
+      this.updateSubsetRects(keys, skipDisconnected);
     }
 
-    // Update specific subset
-    this.updateSubsetRects(keys, skipDisconnected);
+    // Rebuild spatial index after rect updates
+    this.rebuildSpatialGrid();
   }
 
   /**
-   * Returns candidates using an internal reusable array (avoid GC pressure).
-   * IMPORTANT: Treat the returned array as ephemeral. Call candidates() each tick if needed.
-   * @returns Array of candidates (reused across calls).
+   * SPATIAL QUERY: Returns islands near a point (e.g., cursor position).
+   * This is the primary API for frame-to-frame queries - much faster than candidates().
+   *
+   * Performance: O(1) average case - queries only ~9 grid cells regardless of total island count.
+   *
+   * @param px - Query point X coordinate (e.g., mouse.x)
+   * @param py - Query point Y coordinate (e.g., mouse.y)
+   * @param options - Optional query configuration
+   * @returns Array of nearby candidates (reused across calls)
+   */
+  queryNearby(
+    px: number,
+    py: number,
+    options: SpatialQueryOptions = {},
+  ): Candidate[] {
+    const result = this.queryResultCache;
+    result.length = 0;
+
+    const seen = this.seenKeysCache;
+    seen.clear();
+
+    // Compute query cell and bounds
+    const centerX = Math.floor(px / GRID_CELL_SIZE);
+    const centerY = Math.floor(py / GRID_CELL_SIZE);
+
+    const radius = options.radius !== undefined
+      ? Math.ceil(options.radius / GRID_CELL_SIZE)
+      : GRID_QUERY_RADIUS;
+
+    // Scan grid cells in query range
+    const minX = centerX - radius;
+    const maxX = centerX + radius;
+    const minY = centerY - radius;
+    const maxY = centerY + radius;
+
+    for (let cy = minY; cy <= maxY; cy++) {
+      for (let cx = minX; cx <= maxX; cx++) {
+        const cellHash = (cy << 16) | cx;
+        const cell = this.spatialGrid.get(cellHash);
+
+        if (!cell) continue;
+
+        // Process islands in this cell
+        for (let i = 0; i < cell.length; i++) {
+          const key = cell[i];
+
+          // Skip duplicates (islands may span multiple cells)
+          if (seen.has(key)) continue;
+          seen.add(key);
+
+          const handle = this.handlesByKey.get(key);
+          if (!handle) continue;
+
+          result.push({ key: handle.key, rect: handle.rect });
+        }
+      }
+    }
+
+    return result;
+  }
+
+  /**
+   * Returns all candidates using internal reusable array.
+   * NOTE: Prefer queryNearby() for per-frame queries - it's much faster.
+   * Use this only when you need the complete set (e.g., initial scan, debugging).
+   *
+   * @returns Array of all candidates (reused across calls)
    */
   candidates(): Candidate[] {
     const n = this.handles.length;
@@ -129,9 +213,7 @@ export class IslandLocator {
       c.rect = h.rect;
     }
 
-    // Keep array length exact
     this.candidatesCache.length = n;
-
     return this.candidatesCache;
   }
 
@@ -219,19 +301,21 @@ export class IslandLocator {
     return this.visibleKeys;
   }
 
-  // ========================================================================
-  // Private Methods - State Management
-  // ========================================================================
+  // ==========================================================================
+  // Private - State Management
+  // ==========================================================================
 
   private clearState(): void {
     this.handles.length = 0;
     this.handlesByKey.clear();
+    this.spatialGrid.clear();
     this.candidatesCache.length = 0;
-    // Note: visibleKeys are NOT cleared here; managed by IntersectionObserver
+    this.queryResultCache.length = 0;
+    this.seenKeysCache.clear();
+    // Note: visibleKeys managed by IntersectionObserver
   }
 
   private ensureCandidateCacheSize(requiredSize: number): void {
-    // Grow cache if needed, reusing objects to minimize allocations
     while (this.candidatesCache.length < requiredSize) {
       this.candidatesCache.push({
         key: 0 as IslandKey,
@@ -240,9 +324,56 @@ export class IslandLocator {
     }
   }
 
-  // ========================================================================
-  // Private Methods - Handle Collection
-  // ========================================================================
+  // ==========================================================================
+  // Private - Spatial Grid
+  // ==========================================================================
+
+  /**
+   * Rebuilds the spatial grid from current handle rectangles.
+   * Called after scan() and updateRects().
+   *
+   * Performance: O(N * K) where N = handle count, K = cells per handle (usually 1-4).
+   */
+  private rebuildSpatialGrid(): void {
+    this.spatialGrid.clear();
+
+    for (const handle of this.handles) {
+      this.insertHandleIntoGrid(handle);
+    }
+  }
+
+  /**
+   * Inserts a handle into the spatial grid.
+   * Large islands may span multiple cells.
+   */
+  private insertHandleIntoGrid(handle: IslandHandle): void {
+    const r = handle.rect;
+
+    // Compute cell bounds for this island's rect
+    const minX = Math.floor(r.x / GRID_CELL_SIZE);
+    const maxX = Math.floor((r.x + r.w) / GRID_CELL_SIZE);
+    const minY = Math.floor(r.y / GRID_CELL_SIZE);
+    const maxY = Math.floor((r.y + r.h) / GRID_CELL_SIZE);
+
+    // Insert into all overlapping cells
+    for (let cy = minY; cy <= maxY; cy++) {
+      for (let cx = minX; cx <= maxX; cx++) {
+        const cellHash = (cy << 16) | cx;
+
+        let cell = this.spatialGrid.get(cellHash);
+        if (!cell) {
+          cell = [];
+          this.spatialGrid.set(cellHash, cell);
+        }
+
+        cell.push(handle.key);
+      }
+    }
+  }
+
+  // ==========================================================================
+  // Private - Handle Collection
+  // ==========================================================================
 
   private collectIslandHandles(
     elements: NodeListOf<HTMLElement>,
@@ -270,9 +401,9 @@ export class IslandLocator {
     return handles;
   }
 
-  // ========================================================================
-  // Private Methods - Rect Updates
-  // ========================================================================
+  // ==========================================================================
+  // Private - Rect Updates
+  // ==========================================================================
 
   private updateAllRects(skipDisconnected: boolean): void {
     for (const handle of this.handles) {
@@ -303,9 +434,9 @@ export class IslandLocator {
     }
   }
 
-  // ========================================================================
-  // Private Methods - Visibility Tracking
-  // ========================================================================
+  // ==========================================================================
+  // Private - Visibility Tracking
+  // ==========================================================================
 
   private handleVisibilityChange(entries: IntersectionObserverEntry[]): void {
     for (const entry of entries) {

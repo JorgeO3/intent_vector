@@ -1,14 +1,15 @@
-import type { IslandHandle, IslandsRegistry, IslandTypeDef } from "./types.ts";
+import type {
+  ActuatorConfig,
+  IslandHandle,
+  IslandsRegistry,
+  IslandTypeDef,
+} from "./types.ts";
 import { IslandFlags } from "./types.ts";
+import { canUseDOM } from "./utils.ts";
 
 // ============================================================================
 // Type Definitions
 // ============================================================================
-
-export type ActuatorConfig = {
-  readonly useModulePreload: boolean;
-  readonly useFetchPrefetch: boolean;
-};
 
 export type PrefetchHandle = {
   readonly kind: "modulepreload" | "fetch";
@@ -24,6 +25,7 @@ export type PrefetchHandle = {
 type ModuleNamespace = Record<string, unknown>;
 type HydrateFn = (el: HTMLElement, props: unknown) => unknown;
 type HandlerFn = (event: Event, ctx: unknown) => unknown;
+
 type PrefetchTarget = IslandHandle | { readonly entry: string };
 type PrefetchableResource = IslandTypeDef | { readonly entry: string };
 
@@ -65,21 +67,16 @@ const FETCH_OPTIONS = {
 
 const LINK_CROSS_ORIGIN = "anonymous";
 const SPECULATION_SCRIPT_TYPE = "speculationrules";
+const SPECULATION_SCRIPT_ID = "__nk_speculation_rules";
 
 // ============================================================================
 // Environment Guards (SSR safety)
 // ============================================================================
 
-function canUseDOM(): boolean {
-  return typeof document !== "undefined" && typeof HTMLElement !== "undefined";
-}
-
 let speculationRulesSupport: boolean | null = null;
 
 function supportsSpeculationRules(): boolean {
-  if (speculationRulesSupport !== null) {
-    return speculationRulesSupport;
-  }
+  if (speculationRulesSupport !== null) return speculationRulesSupport;
 
   if (!canUseDOM() || typeof HTMLScriptElement === "undefined") {
     speculationRulesSupport = false;
@@ -106,7 +103,7 @@ export class Actuators {
   private readonly modulePreloaded = new Set<string>();
   private readonly prefetchLinked = new Set<string>();
 
-  // Completion tracking (helps future scheduler integration)
+  // Completion tracking (helps scheduler integration)
   private readonly modulePreloadDone = new Map<string, Promise<void>>();
 
   // Speculation Rules batching (single script)
@@ -134,8 +131,10 @@ export class Actuators {
     this.speculatedUrls.clear();
     this.prefetchLinked.clear();
 
-    if (canUseDOM() && this.speculationScript) {
-      this.speculationScript.remove();
+    if (canUseDOM()) {
+      const existing = document.getElementById(SPECULATION_SCRIPT_ID);
+      existing?.remove();
+      this.speculationScript?.remove();
     }
 
     this.speculationScript = null;
@@ -153,14 +152,15 @@ export class Actuators {
     explicitFlags?: number,
   ): PrefetchHandle | null {
     const resource = this.resolveIslandType(target);
-    if (!resource) {
-      return null;
-    }
+    if (!resource) return null;
 
-    const flags = this.resolveFlags(target, explicitFlags);
-    if (!isPrefetchSafe(flags)) {
-      return null;
-    }
+    const instanceFlags = this.resolveFlags(target, explicitFlags);
+    const combinedFlags = combineFlags(
+      instanceFlags,
+      hasDefaultFlags(resource) ? resource.defaultFlags : 0,
+    );
+
+    if (!isPrefetchSafe(combinedFlags)) return null;
 
     return this.executePrefetch(resource.entry);
   }
@@ -169,7 +169,6 @@ export class Actuators {
     const type = this.getIslandType(handle.typeId);
     const module = await this.loadIslandModule(type.entry);
     const hydrateFn = resolveHydrateFn(module, type);
-
     return hydrateFn(handle.el, props);
   }
 
@@ -180,33 +179,22 @@ export class Actuators {
   ): Promise<unknown> {
     const module = await this.loadHandlerModule(entryUrl);
     const handlerFn = resolveHandlerFn(module);
-
-    if (!handlerFn) {
-      return undefined;
-    }
-
+    if (!handlerFn) return undefined;
     return handlerFn(event, ctx);
   }
 
   getNavUrl(typeId: number, props: unknown): string | null {
     const type = this.registry.types[typeId];
-    if (!type?.navProp) {
-      return null;
-    }
-
+    if (!type?.navProp) return null;
     return extractNavUrl(props, type.navProp);
   }
 
   speculatePrefetchUrl(url: string): void {
-    if (!url || this.speculatedUrls.has(url)) {
-      return;
-    }
+    if (!url || this.speculatedUrls.has(url)) return;
 
     this.speculatedUrls.add(url);
 
-    if (!canUseDOM()) {
-      return;
-    }
+    if (!canUseDOM()) return;
 
     if (supportsSpeculationRules()) {
       this.scheduleSpeculationFlush();
@@ -220,9 +208,7 @@ export class Actuators {
   // ========================================================================
 
   private executePrefetch(entry: string): PrefetchHandle | null {
-    if (!canUseDOM()) {
-      return null;
-    }
+    if (!canUseDOM()) return null;
 
     if (this.config.useModulePreload) {
       return this.ensureModulePreload(entry);
@@ -236,15 +222,21 @@ export class Actuators {
   }
 
   private ensureModulePreload(href: string): PrefetchHandle {
-    // Check for existing completion promise
+    // If we already track a completion promise, return it
     const existingDone = this.modulePreloadDone.get(href);
     if (existingDone) {
       this.modulePreloaded.add(href);
       return { kind: "modulepreload", done: existingDone };
     }
 
-    // Already requested but no completion signal tracked
+    // If we already marked it, don't duplicate
     if (this.modulePreloaded.has(href)) {
+      return { kind: "modulepreload" };
+    }
+
+    // Dedup vs existing DOM link (SSR/other runtime)
+    if (modulePreloadExists(href)) {
+      this.modulePreloaded.add(href);
       return { kind: "modulepreload" };
     }
 
@@ -266,7 +258,11 @@ export class Actuators {
   }
 
   private ensurePrefetchLink(url: string): void {
-    if (this.prefetchLinked.has(url)) {
+    if (this.prefetchLinked.has(url)) return;
+
+    // Dedup vs existing DOM link
+    if (prefetchLinkExists(url)) {
+      this.prefetchLinked.add(url);
       return;
     }
 
@@ -281,10 +277,7 @@ export class Actuators {
   // ========================================================================
 
   private scheduleSpeculationFlush(): void {
-    if (this.speculationFlushScheduled) {
-      return;
-    }
-
+    if (this.speculationFlushScheduled) return;
     this.speculationFlushScheduled = true;
 
     // Batch multiple URLs in same tick to avoid DOM thrashing
@@ -295,18 +288,13 @@ export class Actuators {
   }
 
   private flushSpeculationRules(): void {
-    if (!canUseDOM() || !supportsSpeculationRules()) {
-      return;
-    }
-
-    if (this.speculatedUrls.size === 0) {
-      return;
-    }
+    if (!canUseDOM() || !supportsSpeculationRules()) return;
+    if (this.speculatedUrls.size === 0) return;
 
     // Remove existing script to ensure updates are applied
-    if (this.speculationScript) {
-      this.speculationScript.remove();
-    }
+    const existing = document.getElementById(SPECULATION_SCRIPT_ID);
+    existing?.remove();
+    this.speculationScript?.remove();
 
     const urls = Array.from(this.speculatedUrls);
     const config: SpeculationRulesConfig = {
@@ -314,6 +302,8 @@ export class Actuators {
     };
 
     const script = createSpeculationScript(config);
+    script.id = SPECULATION_SCRIPT_ID;
+
     const target = getDocumentAppendTarget();
     target.appendChild(script);
 
@@ -337,13 +327,10 @@ export class Actuators {
     cache: Map<string, ModuleNamespace>,
   ): Promise<ModuleNamespace> {
     const cached = cache.get(entry);
-    if (cached) {
-      return cached;
-    }
+    if (cached) return cached;
 
     const module = await importModule(entry);
     cache.set(entry, module);
-
     return module;
   }
 
@@ -354,6 +341,7 @@ export class Actuators {
   private resolveIslandType(
     target: PrefetchTarget,
   ): PrefetchableResource | null {
+    // Structural: IslandHandle and IslandTypeDef both have typeId
     if ("typeId" in target) {
       return this.registry.types[target.typeId] ?? null;
     }
@@ -364,9 +352,7 @@ export class Actuators {
     target: PrefetchTarget,
     explicitFlags?: number,
   ): number {
-    if (typeof explicitFlags === "number") {
-      return explicitFlags;
-    }
+    if (typeof explicitFlags === "number") return explicitFlags;
 
     if ("flags" in target && typeof target.flags === "number") {
       return target.flags;
@@ -377,16 +363,22 @@ export class Actuators {
 
   private getIslandType(typeId: number): IslandTypeDef {
     const type = this.registry.types[typeId];
-    if (!type) {
-      throw new Error(`Unknown island typeId=${typeId}`);
-    }
+    if (!type) throw new Error(`Unknown island typeId=${typeId}`);
     return type;
   }
 }
 
 // ============================================================================
-// Helper Functions - Type Guards & Checks
+// Helper Functions - Flags & Checks
 // ============================================================================
+
+function combineFlags(instanceFlags: number, defaultFlags: number): number {
+  return (instanceFlags | (defaultFlags | 0)) | 0;
+}
+
+function hasDefaultFlags(x: PrefetchableResource): x is IslandTypeDef {
+  return typeof (x as IslandTypeDef).defaultFlags === "number";
+}
 
 function isPrefetchSafe(flags: number): boolean {
   return (flags & IslandFlags.PrefetchSafe) !== 0;
@@ -431,7 +423,6 @@ function resolveHydrateFn(
 function resolveHandlerFn(module: ModuleNamespace): HandlerFn | null {
   const candidate = module[MODULE_EXPORT_NAMES.DEFAULT] ??
     module[MODULE_EXPORT_NAMES.HANDLE];
-
   return typeof candidate === "function" ? (candidate as HandlerFn) : null;
 }
 
@@ -440,19 +431,29 @@ function resolveHandlerFn(module: ModuleNamespace): HandlerFn | null {
 // ============================================================================
 
 function extractNavUrl(props: unknown, navProp: string): string | null {
-  if (!props || typeof props !== "object") {
-    return null;
-  }
-
+  if (!props || typeof props !== "object") return null;
   const record = props as Record<string, unknown>;
   const value = record[navProp];
-
   return typeof value === "string" && value.length > 0 ? value : null;
 }
 
 // ============================================================================
-// Helper Functions - Link Creation
+// Helper Functions - Link Creation & Dedup
 // ============================================================================
+
+function modulePreloadExists(href: string): boolean {
+  const escaped = CSS.escape(href);
+  return document.head.querySelector(
+    `link[rel="${LINK_REL_TYPES.MODULE_PRELOAD}"][href="${escaped}"]`,
+  ) !== null;
+}
+
+function prefetchLinkExists(href: string): boolean {
+  const escaped = CSS.escape(href);
+  return document.head.querySelector(
+    `link[rel="${LINK_REL_TYPES.PREFETCH}"][href="${escaped}"]`,
+  ) !== null;
+}
 
 function createModulePreloadLink(href: string): HTMLLinkElement {
   const link = document.createElement("link");

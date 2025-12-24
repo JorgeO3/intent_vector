@@ -1,4 +1,3 @@
-// runtime/targetLock.ts
 import type { IntentVector } from "../intent/intentVector.ts";
 import type {
   Candidate,
@@ -7,6 +6,7 @@ import type {
   ScoredTarget,
   Selection,
 } from "./types.ts";
+import { clamp, NO_SCORE, ZERO_SCORE } from "./utils.ts";
 
 // ============================================================================
 // Type Definitions
@@ -47,6 +47,14 @@ type NearestCandidate = {
   readonly d2: number;
 };
 
+type DerivedConfig = {
+  readonly topK: number;
+  readonly reportTopN: number;
+  readonly stickDistSq: number;
+  readonly radiusMulSq: number;
+  readonly holdFrames: number;
+};
+
 // ============================================================================
 // Constants
 // ============================================================================
@@ -68,17 +76,7 @@ const DEFAULT_CONFIG: TargetLockConfig = {
 const DEFAULT_FPS = 60;
 const DEFAULT_FRAME_TIME_MS = 1000 / DEFAULT_FPS;
 
-const NO_SCORE = -1;
-const ZERO_SCORE = 0;
 const INFINITE_DISTANCE = Infinity;
-
-// ============================================================================
-// Utility Functions
-// ============================================================================
-
-export function clamp(value: number, min: number, max: number): number {
-  return value < min ? min : value > max ? max : value;
-}
 
 // ============================================================================
 // Target Lock Class
@@ -87,22 +85,41 @@ export function clamp(value: number, min: number, max: number): number {
 export class TargetLock {
   private readonly core: IntentVector;
   private config: TargetLockConfig;
+  private derived: DerivedConfig;
 
+  // Winner state
   private winnerKey: IslandKey | null = null;
   private winnerScore = ZERO_SCORE;
 
+  // Pending switch state (dwell time)
   private pendingKey: IslandKey | null = null;
   private pendingCount = 0;
 
+  // No-evidence tracking
   private noEvidenceTimeMs = 0;
+
+  // Reusable buffers to minimize allocations (hot path optimization)
+  private readonly topKBuffer: CandidateWithDistance[] = [];
+  private readonly scoredBuffer: ScoredTarget[] = [];
+
+  // Object pool for ScoredTarget (avoids GC pressure in hot path)
+  private readonly scoredPool: ScoredTarget[] = [];
+  private poolIdx = 0;
+  private static readonly POOL_SIZE = 32;
 
   constructor(core: IntentVector, config?: Partial<TargetLockConfig>) {
     this.core = core;
     this.config = { ...DEFAULT_CONFIG, ...config };
+    this.derived = computeDerived(this.config);
+    // Pre-allocate object pool
+    for (let i = 0; i < TargetLock.POOL_SIZE; i++) {
+      this.scoredPool.push({ key: 0 as IslandKey, score: 0, d2: 0 });
+    }
   }
 
   setConfig(config: Partial<TargetLockConfig>): void {
     this.config = { ...this.config, ...config };
+    this.derived = computeDerived(this.config);
   }
 
   reset(): void {
@@ -113,259 +130,279 @@ export class TargetLock {
     this.noEvidenceTimeMs = 0;
   }
 
+  /**
+   * Main selection algorithm.
+   * Evaluates candidates and returns current selection state.
+   */
   select(
     candidates: Candidate[],
     deltaTimeMs = DEFAULT_FRAME_TIME_MS,
   ): Selection {
     const kinematics = this.core.getKinematics();
-    const speed = Math.sqrt(kinematics.v2);
+    const speed = kinematics.v2 > 0 ? Math.sqrt(kinematics.v2) : 0;
 
-    // Build top-K candidates by distance
-    const topK = this.buildTopKCandidates(
-      candidates,
-      kinematics.px,
-      kinematics.py,
-    );
-    const nearest = this.findNearestCandidate(
+    // Build top-K + nearest in one pass (reuses buffers)
+    const nearest = this.buildTopKAndNearest(
       candidates,
       kinematics.px,
       kinematics.py,
     );
 
-    // Score candidates
-    const scoringResult = this.scoreCandidates(topK);
+    // Score candidates (reuses scoredBuffer)
+    const scoring = this.scoreCandidates();
 
-    // Update winner score with decay if needed
-    this.updateWinnerScore(scoringResult.currentWinnerScore);
+    const margin2nd = scoring.bestScore - scoring.secondScore;
+    const hasEvidence = scoring.bestKey !== null &&
+      scoring.bestScore >= this.config.scoreFloor;
 
-    // Prepare scored targets for output
-    const scoredTargets = this.prepareOutputTargets(scoringResult.scored);
+    // Update winner score (correctness: no double-decay)
+    this.updateWinnerScore(hasEvidence, scoring.currentWinnerScore);
 
-    const margin = scoringResult.bestScore - scoringResult.secondScore;
-    const hasEvidence = this.hasValidEvidence(
-      scoringResult.bestKey,
-      scoringResult.bestScore,
-    );
+    // Prepare output targets
+    const top = this.prepareOutputTargets();
 
-    // Handle no-evidence case
+    // Handle no-evidence regime
     if (!hasEvidence) {
       return this.handleNoEvidence(
         deltaTimeMs,
         nearest,
-        scoringResult,
-        margin,
+        scoring,
+        margin2nd,
         speed,
-        scoredTargets,
+        top,
       );
     }
 
     // Evidence restored
     this.noEvidenceTimeMs = 0;
 
-    // Determine selection state
-    return this.determineSelection(
-      scoringResult,
-      margin,
-      nearest,
-      speed,
-      scoredTargets,
-    );
+    // Determine selection
+    return this.determineSelection(scoring, margin2nd, nearest, speed, top);
   }
 
   // ========================================================================
-  // Private - Candidate Processing
+  // Private - Candidate Processing (HOT PATH)
   // ========================================================================
 
-  private buildTopKCandidates(
-    candidates: Candidate[],
-    px: number,
-    py: number,
-  ): CandidateWithDistance[] {
-    const k = Math.max(1, this.config.topK | 0);
-    const topK: CandidateWithDistance[] = [];
-
-    for (const candidate of candidates) {
-      const distance = this.computeCandidateDistance(candidate, px, py);
-      this.insertSortedByDistance(topK, distance, k);
-    }
-
-    // Force-include current winner
-    this.ensureWinnerIncluded(candidates, px, py, topK, k);
-
-    return topK;
-  }
-
-  private computeCandidateDistance(
-    candidate: Candidate,
-    px: number,
-    py: number,
-  ): CandidateWithDistance {
-    const closestPoint = this.findClosestPointInRect(candidate.rect, px, py);
-    const dx = closestPoint.x - px;
-    const dy = closestPoint.y - py;
-    const d2 = dx * dx + dy * dy;
-
-    return {
-      key: candidate.key,
-      rect: candidate.rect,
-      d2,
-      dx,
-      dy,
-    };
-  }
-
-  private findClosestPointInRect(
-    rect: Rect,
-    px: number,
-    py: number,
-  ): { x: number; y: number } {
-    const x = clamp(px, rect.x, rect.x + rect.w);
-    const y = clamp(py, rect.y, rect.y + rect.h);
-    return { x, y };
-  }
-
-  private insertSortedByDistance(
-    array: CandidateWithDistance[],
-    item: CandidateWithDistance,
-    maxSize: number,
-  ): void {
-    if (array.length === maxSize && item.d2 >= array[maxSize - 1].d2) {
-      return;
-    }
-
-    let insertIndex = 0;
-    while (insertIndex < array.length && array[insertIndex].d2 <= item.d2) {
-      insertIndex++;
-    }
-
-    array.splice(insertIndex, 0, item);
-
-    if (array.length > maxSize) {
-      array.length = maxSize;
-    }
-  }
-
-  private ensureWinnerIncluded(
-    candidates: Candidate[],
-    px: number,
-    py: number,
-    topK: CandidateWithDistance[],
-    k: number,
-  ): void {
-    if (this.winnerKey === null) return;
-
-    const winnerInTopK = topK.some((item) => item.key === this.winnerKey);
-    if (winnerInTopK) return;
-
-    const winnerCandidate = candidates.find((c) => c.key === this.winnerKey);
-    if (!winnerCandidate) return;
-
-    const winnerDistance = this.computeCandidateDistance(
-      winnerCandidate,
-      px,
-      py,
-    );
-    this.insertSortedByDistance(topK, winnerDistance, k);
-  }
-
-  private findNearestCandidate(
+  /**
+   * Builds top-K candidates and finds nearest in a single pass.
+   * OPTIMIZATION: Reuses topKBuffer to avoid allocations.
+   */
+  private buildTopKAndNearest(
     candidates: Candidate[],
     px: number,
     py: number,
   ): NearestCandidate {
+    const buffer = this.topKBuffer;
+    buffer.length = 0; // Clear without allocating
+
+    const k = this.derived.topK;
     let nearestKey: IslandKey | null = null;
     let nearestD2 = INFINITE_DISTANCE;
 
-    for (const candidate of candidates) {
-      const distance = this.computeCandidateDistance(candidate, px, py);
+    let winnerDistance: CandidateWithDistance | null = null;
+    let winnerInTopK = false;
 
-      if (distance.d2 < nearestD2) {
-        nearestD2 = distance.d2;
-        nearestKey = distance.key;
+    // Single pass: compute distances, track nearest, build top-K
+    for (let i = 0; i < candidates.length; i++) {
+      const candidate = candidates[i];
+      const dist = this.computeCandidateDistance(candidate, px, py);
+
+      // Track nearest
+      if (dist.d2 < nearestD2) {
+        nearestD2 = dist.d2;
+        nearestKey = dist.key;
       }
+
+      // Track winner if present
+      if (this.winnerKey !== null && dist.key === this.winnerKey) {
+        winnerDistance = dist;
+        winnerInTopK = false; // Will check after insertion
+      }
+
+      // Insert into top-K
+      this.insertSortedByDistance(dist, k);
+
+      // Check if winner is now in top-K
+      if (winnerDistance && !winnerInTopK) {
+        for (let j = 0; j < buffer.length; j++) {
+          if (buffer[j].key === this.winnerKey) {
+            winnerInTopK = true;
+            break;
+          }
+        }
+      }
+    }
+
+    // Force-include winner if not in top-K
+    if (winnerDistance && !winnerInTopK) {
+      this.insertSortedByDistance(winnerDistance, k);
     }
 
     return { key: nearestKey, d2: nearestD2 };
   }
 
+  /**
+   * OPTIMIZATION: Inline distance calculation with manual clamp.
+   */
+  private computeCandidateDistance(
+    candidate: Candidate,
+    px: number,
+    py: number,
+  ): CandidateWithDistance {
+    const r = candidate.rect;
+    const rx2 = r.x + r.w;
+    const ry2 = r.y + r.h;
+
+    // Inline clamp (faster than function call)
+    const cx = px < r.x ? r.x : px > rx2 ? rx2 : px;
+    const cy = py < r.y ? r.y : py > ry2 ? ry2 : py;
+
+    const dx = cx - px;
+    const dy = cy - py;
+    const d2 = dx * dx + dy * dy;
+
+    return { key: candidate.key, rect: r, d2, dx, dy };
+  }
+
+  /**
+   * OPTIMIZATION: Binary search insertion for better performance with larger K.
+   */
+  private insertSortedByDistance(
+    item: CandidateWithDistance,
+    maxSize: number,
+  ): void {
+    const buffer = this.topKBuffer;
+
+    // Early exit: buffer full and item is farther than worst
+    if (buffer.length === maxSize && item.d2 >= buffer[maxSize - 1].d2) {
+      return;
+    }
+
+    // Binary search for insertion point
+    let left = 0;
+    let right = buffer.length;
+
+    while (left < right) {
+      const mid = (left + right) >>> 1; // Fast integer division
+      if (buffer[mid].d2 <= item.d2) {
+        left = mid + 1;
+      } else {
+        right = mid;
+      }
+    }
+
+    buffer.splice(left, 0, item);
+
+    // Maintain max size
+    if (buffer.length > maxSize) {
+      buffer.length = maxSize;
+    }
+  }
+
   // ========================================================================
-  // Private - Scoring
+  // Private - Scoring (HOT PATH)
   // ========================================================================
 
-  private scoreCandidates(topK: CandidateWithDistance[]): ScoringResult {
+  /**
+   * OPTIMIZATION: Reuses scoredBuffer and object pool to avoid allocations.
+   */
+  private scoreCandidates(): ScoringResult {
     let bestKey: IslandKey | null = null;
     let bestScore = NO_SCORE;
     let secondScore = NO_SCORE;
     let currentWinnerScore = NO_SCORE;
 
-    const scored: ScoredTarget[] = [];
+    const scoredBuffer = this.scoredBuffer;
+    scoredBuffer.length = 0; // Clear without allocating
+    this.poolIdx = 0; // Reset pool index
 
-    for (const candidate of topK) {
-      const score = this.scoreCandidate(candidate);
+    const buffer = this.topKBuffer;
 
-      if (this.winnerKey !== null && candidate.key === this.winnerKey) {
+    for (let i = 0; i < buffer.length; i++) {
+      const c = buffer[i];
+      const score = this.scoreCandidate(c);
+
+      // Track current winner score
+      if (this.winnerKey !== null && c.key === this.winnerKey) {
         currentWinnerScore = score;
       }
 
+      // Track best and second-best
       if (score > bestScore) {
         secondScore = bestScore;
         bestScore = score;
-        bestKey = candidate.key;
+        bestKey = c.key;
       } else if (score > secondScore) {
         secondScore = score;
       }
 
-      scored.push({
-        key: candidate.key,
-        score,
-        d2: candidate.d2,
-      });
+      // Use pooled object instead of creating new one
+      const pooled = this.acquirePooledScored(c.key, score, c.d2);
+      scoredBuffer.push(pooled);
     }
 
     return {
-      scored,
+      scored: scoredBuffer,
       bestKey,
-      bestScore: Math.max(bestScore, ZERO_SCORE),
-      secondScore: Math.max(secondScore, ZERO_SCORE),
+      bestScore: bestScore > 0 ? bestScore : 0,
+      secondScore: secondScore > 0 ? secondScore : 0,
       currentWinnerScore,
     };
   }
 
+  /**
+   * OPTIMIZATION: Inline radius calculation using pre-computed radiusMulSq.
+   */
   private scoreCandidate(candidate: CandidateWithDistance): number {
-    const radiusSq = this.computeTargetRadiusSquared(candidate.rect);
+    const rect = candidate.rect;
+    const minDim = rect.w < rect.h ? rect.w : rect.h;
+    const radiusSq = this.derived.radiusMulSq * minDim * minDim;
+
     return this.core.hintVector(candidate.dx, candidate.dy, radiusSq);
   }
 
-  private computeTargetRadiusSquared(rect: Rect): number {
-    const radius = this.config.radiusMul * Math.min(rect.w, rect.h);
-    return radius * radius;
-  }
+  /**
+   * OPTIMIZATION: In-place sort and slice (no copy unless needed).
+   */
+  private prepareOutputTargets(): ScoredTarget[] {
+    const buffer = this.scoredBuffer;
+    const reportN = this.derived.reportTopN;
 
-  private prepareOutputTargets(scored: ScoredTarget[]): ScoredTarget[] {
-    const reportN = clamp(this.config.reportTopN | 0, 1, this.config.topK);
-    const sorted = [...scored].sort((a, b) => b.score - a.score);
-    return sorted.slice(0, reportN);
+    // Early exit: no targets
+    if (buffer.length === 0) return [];
+
+    // Sort in-place by score descending
+    buffer.sort((a, b) => b.score - a.score);
+
+    // Return slice (only allocates if reportN < buffer.length)
+    return reportN >= buffer.length ? buffer : buffer.slice(0, reportN);
   }
 
   // ========================================================================
   // Private - Winner Management
   // ========================================================================
 
-  private updateWinnerScore(currentWinnerScore: number): void {
+  /**
+   * CORRECTNESS: Prevents double-decay in no-evidence regime.
+   * Only decay once per frame, not per call.
+   */
+  private updateWinnerScore(
+    hasEvidence: boolean,
+    currentWinnerScore: number,
+  ): void {
     if (this.winnerKey === null) return;
 
+    if (!hasEvidence) {
+      // No-evidence regime: decay once per frame
+      this.winnerScore *= this.config.decay;
+      return;
+    }
+
+    // Evidence exists: update with measured score if available
     if (currentWinnerScore >= 0) {
       this.winnerScore = currentWinnerScore;
-    } else {
-      this.winnerScore *= this.config.decay;
     }
-  }
-
-  private hasValidEvidence(
-    bestKey: IslandKey | null,
-    bestScore: number,
-  ): boolean {
-    return bestKey !== null && bestScore >= this.config.scoreFloor;
   }
 
   // ========================================================================
@@ -378,73 +415,30 @@ export class TargetLock {
     scoring: ScoringResult,
     margin: number,
     speed: number,
-    scoredTargets: ScoredTarget[],
+    top: ScoredTarget[],
   ): Selection {
-    this.noEvidenceTimeMs += Math.max(0, deltaTimeMs);
+    this.noEvidenceTimeMs += deltaTimeMs > 0 ? deltaTimeMs : 0;
 
-    // Try to hold onto winner if still nearby
+    // Try to hold winner if still nearby
     if (this.canHoldWinner(nearest)) {
-      return this.createSelectionWithHeldWinner(
+      this.clearPending();
+      return this.createSelection(
+        this.winnerKey,
+        this.winnerScore,
         scoring,
         margin,
         nearest,
         speed,
-        scoredTargets,
+        false,
+        top,
       );
     }
 
-    // Clear if too long without evidence
+    // Clear state if too long without evidence
     if (this.noEvidenceTimeMs >= this.config.clearAfterMs) {
       this.clearState();
     }
 
-    return this.createNoSelectionResult(
-      scoring,
-      margin,
-      nearest,
-      speed,
-      scoredTargets,
-    );
-  }
-
-  private canHoldWinner(nearest: NearestCandidate): boolean {
-    if (this.winnerKey === null) return false;
-    if (nearest.key !== this.winnerKey) return false;
-    if (this.noEvidenceTimeMs > this.config.noEvidenceHoldMs) return false;
-
-    const stickDistSq = this.config.stickDistPx * this.config.stickDistPx;
-    return nearest.d2 <= stickDistSq;
-  }
-
-  private createSelectionWithHeldWinner(
-    scoring: ScoringResult,
-    margin: number,
-    nearest: NearestCandidate,
-    speed: number,
-    scoredTargets: ScoredTarget[],
-  ): Selection {
-    this.winnerScore *= this.config.decay;
-    this.clearPending();
-
-    return this.createSelection(
-      this.winnerKey,
-      this.winnerScore,
-      scoring,
-      margin,
-      nearest,
-      speed,
-      false,
-      scoredTargets,
-    );
-  }
-
-  private createNoSelectionResult(
-    scoring: ScoringResult,
-    margin: number,
-    nearest: NearestCandidate,
-    speed: number,
-    scoredTargets: ScoredTarget[],
-  ): Selection {
     return this.createSelection(
       null,
       scoring.bestScore,
@@ -453,8 +447,16 @@ export class TargetLock {
       nearest,
       speed,
       false,
-      scoredTargets,
+      top,
     );
+  }
+
+  private canHoldWinner(nearest: NearestCandidate): boolean {
+    if (this.winnerKey === null) return false;
+    if (nearest.key !== this.winnerKey) return false;
+    if (this.noEvidenceTimeMs > this.config.noEvidenceHoldMs) return false;
+
+    return nearest.d2 <= this.derived.stickDistSq;
   }
 
   // ========================================================================
@@ -466,32 +468,20 @@ export class TargetLock {
     margin: number,
     nearest: NearestCandidate,
     speed: number,
-    scoredTargets: ScoredTarget[],
+    top: ScoredTarget[],
   ): Selection {
     // First winner
     if (this.winnerKey === null) {
-      return this.establishFirstWinner(
-        scoring,
-        margin,
-        nearest,
-        speed,
-        scoredTargets,
-      );
+      return this.establishFirstWinner(scoring, margin, nearest, speed, top);
     }
 
     // Same winner
     if (scoring.bestKey === this.winnerKey) {
-      return this.confirmCurrentWinner(
-        scoring,
-        margin,
-        nearest,
-        speed,
-        scoredTargets,
-      );
+      return this.confirmCurrentWinner(scoring, margin, nearest, speed, top);
     }
 
-    // Potential switch
-    return this.evaluateSwitch(scoring, margin, nearest, speed, scoredTargets);
+    // Evaluate potential switch
+    return this.evaluateSwitch(scoring, margin, nearest, speed, top);
   }
 
   private establishFirstWinner(
@@ -499,7 +489,7 @@ export class TargetLock {
     margin: number,
     nearest: NearestCandidate,
     speed: number,
-    scoredTargets: ScoredTarget[],
+    top: ScoredTarget[],
   ): Selection {
     this.winnerKey = scoring.bestKey;
     this.winnerScore = scoring.bestScore;
@@ -515,7 +505,7 @@ export class TargetLock {
       nearest,
       speed,
       actuate,
-      scoredTargets,
+      top,
     );
   }
 
@@ -524,7 +514,7 @@ export class TargetLock {
     margin: number,
     nearest: NearestCandidate,
     speed: number,
-    scoredTargets: ScoredTarget[],
+    top: ScoredTarget[],
   ): Selection {
     this.winnerScore = scoring.bestScore;
     this.clearPending();
@@ -539,7 +529,7 @@ export class TargetLock {
       nearest,
       speed,
       actuate,
-      scoredTargets,
+      top,
     );
   }
 
@@ -548,9 +538,11 @@ export class TargetLock {
     margin: number,
     nearest: NearestCandidate,
     speed: number,
-    scoredTargets: ScoredTarget[],
+    top: ScoredTarget[],
   ): Selection {
-    const shouldSwitch = this.shouldSwitchWinner(scoring, margin);
+    const shouldSwitch =
+      scoring.bestScore >= this.winnerScore + this.config.switchMargin &&
+      margin >= this.config.minMargin2nd;
 
     if (!shouldSwitch) {
       return this.createSelection(
@@ -561,24 +553,11 @@ export class TargetLock {
         nearest,
         speed,
         false,
-        scoredTargets,
+        top,
       );
     }
 
-    return this.processSwitchDwell(
-      scoring,
-      margin,
-      nearest,
-      speed,
-      scoredTargets,
-    );
-  }
-
-  private shouldSwitchWinner(scoring: ScoringResult, margin: number): boolean {
-    return (
-      scoring.bestScore >= this.winnerScore + this.config.switchMargin &&
-      margin >= this.config.minMargin2nd
-    );
+    return this.processSwitchDwell(scoring, margin, nearest, speed, top);
   }
 
   private processSwitchDwell(
@@ -586,8 +565,9 @@ export class TargetLock {
     margin: number,
     nearest: NearestCandidate,
     speed: number,
-    scoredTargets: ScoredTarget[],
+    top: ScoredTarget[],
   ): Selection {
+    // New pending target
     if (this.pendingKey !== scoring.bestKey) {
       this.pendingKey = scoring.bestKey;
       this.pendingCount = 1;
@@ -600,16 +580,32 @@ export class TargetLock {
         nearest,
         speed,
         false,
-        scoredTargets,
+        top,
       );
     }
 
+    // Increment dwell counter
     this.pendingCount++;
 
-    if (this.pendingCount >= this.config.holdFrames) {
-      return this.executeSwitch(scoring, margin, nearest, speed, scoredTargets);
+    // Execute switch if dwell time met
+    if (this.pendingCount >= this.derived.holdFrames) {
+      this.winnerKey = scoring.bestKey;
+      this.winnerScore = scoring.bestScore;
+      this.clearPending();
+
+      return this.createSelection(
+        this.winnerKey,
+        this.winnerScore,
+        scoring,
+        margin,
+        nearest,
+        speed,
+        true,
+        top,
+      );
     }
 
+    // Still dwelling
     return this.createSelection(
       this.winnerKey,
       this.winnerScore,
@@ -618,30 +614,7 @@ export class TargetLock {
       nearest,
       speed,
       false,
-      scoredTargets,
-    );
-  }
-
-  private executeSwitch(
-    scoring: ScoringResult,
-    margin: number,
-    nearest: NearestCandidate,
-    speed: number,
-    scoredTargets: ScoredTarget[],
-  ): Selection {
-    this.winnerKey = scoring.bestKey;
-    this.winnerScore = scoring.bestScore;
-    this.clearPending();
-
-    return this.createSelection(
-      this.winnerKey,
-      this.winnerScore,
-      scoring,
-      margin,
-      nearest,
-      speed,
-      true,
-      scoredTargets,
+      top,
     );
   }
 
@@ -662,6 +635,31 @@ export class TargetLock {
   }
 
   // ========================================================================
+  // Private - Object Pool
+  // ========================================================================
+
+  /**
+   * OPTIMIZATION: Acquire a pooled ScoredTarget object.
+   * Reuses pre-allocated objects to avoid GC pressure.
+   */
+  private acquirePooledScored(
+    key: IslandKey,
+    score: number,
+    d2: number,
+  ): ScoredTarget {
+    if (this.poolIdx < this.scoredPool.length) {
+      const obj = this.scoredPool[this.poolIdx++];
+      // Mutate in place (type assertion needed for readonly)
+      (obj as { key: IslandKey }).key = key;
+      (obj as { score: number }).score = score;
+      (obj as { d2: number }).d2 = d2;
+      return obj;
+    }
+    // Fallback: create new if pool exhausted
+    return { key, score, d2 };
+  }
+
+  // ========================================================================
   // Private - Selection Creation
   // ========================================================================
 
@@ -673,7 +671,7 @@ export class TargetLock {
     nearest: NearestCandidate,
     speed: number,
     actuate: boolean,
-    scoredTargets: ScoredTarget[],
+    top: ScoredTarget[],
   ): Selection {
     return {
       key,
@@ -688,7 +686,21 @@ export class TargetLock {
       actuate,
       pendingKey: this.pendingKey,
       pendingCount: this.pendingCount,
-      top: scoredTargets,
+      top,
     };
   }
+}
+
+// ============================================================================
+// Configuration Helpers
+// ============================================================================
+
+function computeDerived(config: TargetLockConfig): DerivedConfig {
+  const topK = Math.max(1, config.topK | 0);
+  const reportTopN = clamp(config.reportTopN | 0, 1, topK);
+  const stickDistSq = Math.max(0, config.stickDistPx) ** 2;
+  const radiusMulSq = Math.max(0, config.radiusMul) ** 2;
+  const holdFrames = Math.max(1, config.holdFrames | 0);
+
+  return { topK, reportTopN, stickDistSq, radiusMulSq, holdFrames };
 }

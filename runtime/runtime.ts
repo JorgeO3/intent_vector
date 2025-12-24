@@ -1,12 +1,13 @@
 import { IntentVector } from "../intent/intentVector.ts";
 import { loadPropsPool, loadRegistry } from "./islandManifest.ts";
 import { IslandLocator } from "./islandLocator.ts";
-import { clamp, TargetLock } from "./targetLock.ts";
+import { TargetLock } from "./targetLock.ts";
 import { PressureMonitor } from "./pressure.ts";
 import { ReputationLedger } from "./reputationLedger.ts";
 import { UtilityGate } from "./utilityGate.ts";
 import { Actuators } from "./actuators.ts";
 import { FlightScheduler } from "./flightScheduler.ts";
+import { clamp, getCurrentRouteId, parseJsonSafely } from "./utils.ts";
 
 import type {
   Candidate,
@@ -580,14 +581,6 @@ export class IntentFirstRuntime {
 // Utility Functions
 // ============================================================================
 
-function getCurrentRouteId(): string {
-  const globals = globalThis as GlobalWithLocation;
-  const pathname = globals.location?.pathname;
-  return typeof pathname === "string" && pathname.length
-    ? pathname
-    : DEFAULT_ROUTE_ID;
-}
-
 function findClosestIsland(
   element: HTMLElement,
   selector: string,
@@ -598,13 +591,4 @@ function findClosestIsland(
 function computeElementRect(element: HTMLElement): Rect {
   const bounds = element.getBoundingClientRect();
   return { x: bounds.left, y: bounds.top, w: bounds.width, h: bounds.height };
-}
-
-function parseJsonSafely(json: string | undefined): unknown {
-  if (!json) return null;
-  try {
-    return JSON.parse(json) as unknown;
-  } catch {
-    return null;
-  }
 }

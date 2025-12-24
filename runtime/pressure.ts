@@ -1,5 +1,5 @@
-// runtime/pressureMonitor.ts
-import type { NavigatorWithConnection, NetworkInformation } from "./types.ts";
+import type { PressureConfig } from "./types.ts";
+import { clamp, getConnection, isOutsideWindow, safeNow } from "./utils.ts";
 
 // ============================================================================
 // Type Definitions
@@ -9,11 +9,6 @@ export type PressureSignals = {
   readonly cpuPressure: number;
   readonly netPressure: number;
   readonly saveData: boolean;
-};
-
-export type PressureConfig = {
-  readonly longTaskWindowMs: number;
-  readonly longTaskBudgetMs: number;
 };
 
 type EffectiveConnectionType = "slow-2g" | "2g" | "3g" | "4g" | "";
@@ -51,15 +46,30 @@ const PERFORMANCE_ENTRY_TYPE = "longtask";
 const COMPACT_HEAD_THRESHOLD = 64;
 const COMPACT_RATIO_NUM = 2; // if head * 2 > len => compact
 
-// ============================================================================
-// Public API - Network Connection (SSR-safe)
-// ============================================================================
-
-export function getConnection(): NetworkInformation | undefined {
-  if (typeof navigator === "undefined") return undefined;
-  const nav = navigator as NavigatorWithConnection;
-  return nav.connection;
-}
+// Lookup table for downlink pressure (0-10 Mbps in 0.5 steps)
+// Branchless: index = (mbps * 2) | 0, clamped to [0, 19]
+const DOWNLINK_PRESSURE_LUT = [
+  1.00,
+  1.00,
+  0.85,
+  0.70,
+  0.55,
+  0.45,
+  0.35,
+  0.25,
+  0.25,
+  0.25, // 0-4.5 Mbps
+  0.20,
+  0.20,
+  0.15,
+  0.15,
+  0.10,
+  0.10,
+  0.10,
+  0.10,
+  0.10,
+  0.10, // 5-9.5 Mbps
+] as const;
 
 // ============================================================================
 // Pressure Monitor Class
@@ -77,10 +87,11 @@ export class PressureMonitor {
   private lastEngineMs = 0;
 
   private observer: PerformanceObserver | null = null;
+  private observerInitialized = false; // Lazy init flag
 
   constructor(config?: Partial<PressureConfig>) {
     this.config = { ...DEFAULT_CONFIG, ...config };
-    this.initializeLongTaskObserver();
+    // OPTIMIZATION: Defer observer initialization until first read()
   }
 
   dispose(): void {
@@ -93,10 +104,17 @@ export class PressureMonitor {
   }
 
   setLastEngineCostMs(ms: number): void {
-    this.lastEngineMs = Math.max(PRESSURE_MIN, ms);
+    // Handle NaN/Infinity by treating as 0
+    this.lastEngineMs = Number.isFinite(ms) ? Math.max(PRESSURE_MIN, ms) : 0;
   }
 
   read(): PressureSignals {
+    // Lazy initialization of observer (deferred from constructor)
+    if (!this.observerInitialized) {
+      this.observerInitialized = true;
+      this.initializeLongTaskObserver();
+    }
+
     const now = safeNow();
     this.compactLongTasks(now);
 
@@ -223,20 +241,13 @@ export class PressureMonitor {
       (connection?.effectiveType ?? "") as EffectiveConnectionType;
     let netPressure = getNetPressureForType(effectiveType);
 
-    // Optional: refine with downlink if present (keep conservative)
+    // Refine with downlink using lookup table (branchless)
     const downlink = (connection as unknown as { downlink?: number })?.downlink;
-    if (
-      typeof downlink === "number" && Number.isFinite(downlink) && downlink > 0
-    ) {
-      // crude mapping: slower downlink => higher pressure
-      const byDownlink = downlink <= 0.5
-        ? 1.0
-        : downlink <= 1.0
-        ? 0.85
-        : downlink <= 2.0
-        ? 0.55
-        : 0.25;
-      netPressure = Math.max(netPressure, byDownlink);
+    if (typeof downlink === "number" && downlink > 0) {
+      const idx = (downlink * 2) | 0;
+      const byDownlink = DOWNLINK_PRESSURE_LUT[idx < 20 ? idx : 19];
+      // Use max inline (branchless: a > b ? a : b)
+      netPressure = netPressure > byDownlink ? netPressure : byDownlink;
     }
 
     return { netPressure: clampPressure(netPressure), saveData };
@@ -258,27 +269,6 @@ function supportsLongTaskObserver(): boolean {
 }
 
 // ============================================================================
-// Time helpers
-// ============================================================================
-
-function safeNow(): number {
-  if (
-    typeof performance !== "undefined" && typeof performance.now === "function"
-  ) {
-    return performance.now();
-  }
-  return Date.now();
-}
-
-function isOutsideWindow(
-  now: number,
-  timestamp: number,
-  windowMs: number,
-): boolean {
-  return now - timestamp > windowMs;
-}
-
-// ============================================================================
 // Network pressure helpers
 // ============================================================================
 
@@ -291,5 +281,5 @@ function getNetPressureForType(effectiveType: string): number {
 // ============================================================================
 
 function clampPressure(value: number): number {
-  return Math.min(PRESSURE_MAX, Math.max(PRESSURE_MIN, value));
+  return clamp(value, PRESSURE_MIN, PRESSURE_MAX);
 }

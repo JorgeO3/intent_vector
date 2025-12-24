@@ -1,0 +1,14 @@
+# Build outputs
+dist/
+
+# Deno cache (usually not committed)
+.deno/
+
+# Editor
+.vscode/
+*.swp
+*~
+
+# OS
+.DS_Store
+Thumbs.db

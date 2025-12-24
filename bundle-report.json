@@ -1,0 +1,123 @@
+{
+  "modules": [
+    {
+      "name": "keyCodec",
+      "path": "runtime/keyCodec.ts",
+      "raw": 3098,
+      "gzipped": 1163,
+      "brotli": 975,
+      "lines": 93
+    },
+    {
+      "name": "types",
+      "path": "runtime/types.ts",
+      "raw": 4246,
+      "gzipped": 1485,
+      "brotli": 1292,
+      "lines": 155
+    },
+    {
+      "name": "intentVector",
+      "path": "intent/intentVector.ts",
+      "raw": 12741,
+      "gzipped": 3610,
+      "brotli": 3196,
+      "lines": 445
+    },
+    {
+      "name": "islandLocator",
+      "path": "runtime/islandLocator.ts",
+      "raw": 15067,
+      "gzipped": 4091,
+      "brotli": 3484,
+      "lines": 531
+    },
+    {
+      "name": "islandManifest",
+      "path": "runtime/islandManifest.ts",
+      "raw": 12161,
+      "gzipped": 3201,
+      "brotli": 2778,
+      "lines": 440
+    },
+    {
+      "name": "islandToken",
+      "path": "runtime/islandToken.ts",
+      "raw": 6949,
+      "gzipped": 1952,
+      "brotli": 1702,
+      "lines": 253
+    },
+    {
+      "name": "reputationLedger",
+      "path": "runtime/reputationLedger.ts",
+      "raw": 3805,
+      "gzipped": 1002,
+      "brotli": 915,
+      "lines": 135
+    },
+    {
+      "name": "targetLock",
+      "path": "runtime/targetLock.ts",
+      "raw": 18849,
+      "gzipped": 4308,
+      "brotli": 3793,
+      "lines": 707
+    },
+    {
+      "name": "flightScheduler",
+      "path": "runtime/flightScheduler.ts",
+      "raw": 20142,
+      "gzipped": 4811,
+      "brotli": 4222,
+      "lines": 701
+    },
+    {
+      "name": "utilityGate",
+      "path": "runtime/utilityGate.ts",
+      "raw": 15691,
+      "gzipped": 3975,
+      "brotli": 3509,
+      "lines": 545
+    },
+    {
+      "name": "pressure",
+      "path": "runtime/pressure.ts",
+      "raw": 8601,
+      "gzipped": 2479,
+      "brotli": 2169,
+      "lines": 286
+    },
+    {
+      "name": "actuators",
+      "path": "runtime/actuators.ts",
+      "raw": 15476,
+      "gzipped": 3832,
+      "brotli": 3338,
+      "lines": 511
+    },
+    {
+      "name": "runtime",
+      "path": "runtime/runtime.ts",
+      "raw": 16638,
+      "gzipped": 4103,
+      "brotli": 3605,
+      "lines": 595
+    },
+    {
+      "name": "main",
+      "path": "main.ts",
+      "raw": 7410,
+      "gzipped": 1835,
+      "brotli": 1624,
+      "lines": 256
+    }
+  ],
+  "total": {
+    "raw": 160874,
+    "gzipped": 41847,
+    "brotli": 36602,
+    "lines": 5653
+  },
+  "timestamp": "2025-12-24T03:23:35.192Z"
+}

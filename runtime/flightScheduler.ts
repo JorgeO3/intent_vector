@@ -2,41 +2,20 @@ import type {
   IslandHandle,
   IslandKey,
   IslandsRegistry,
+  IslandState,
   IslandTypeDef,
+  SchedulerConfig,
 } from "./types.ts";
-import { IslandFlags } from "./types.ts";
+import { IslandFlags, IslandSt } from "./types.ts";
 import type { Decision } from "./utilityGate.ts";
-import type { Actuators } from "./actuators.ts";
+import type { Actuators, PrefetchHandle } from "./actuators.ts";
 import type { ReputationLedger } from "./reputationLedger.ts";
 import { decodeKey } from "./keyCodec.ts";
+import { clamp, createIslandId, getDownlinkBytesPerMs } from "./utils.ts";
 
 // ============================================================================
 // Type Definitions
 // ============================================================================
-
-export type SchedulerConfig = {
-  readonly maxInflightFetch: number;
-  readonly maxBytesInFlight: number;
-  readonly prefetchTTLms: number;
-  readonly falsePositiveCooldownMs: number;
-  readonly assumeReadyDelayMs: number;
-  readonly allowEarlyHydrate: boolean;
-  readonly maxAssumeReadyDelayMs: number;
-  readonly dispatchScanLimit: number;
-};
-
-type IslandState =
-  | { st: "Idle"; lastActionTs: number; cooldownUntil: number }
-  | {
-    st: "Prefetching";
-    startedTs: number;
-    bytes: number;
-    readyDelayMs: number;
-    handle: { abort?: () => void } | null;
-  }
-  | { st: "Prefetched"; readyTs: number; expiresTs: number }
-  | { st: "Hydrating"; startedTs: number }
-  | { st: "Hydrated"; readyTs: number };
 
 type QueueItem = {
   readonly key: IslandKey;
@@ -70,7 +49,6 @@ const PRIORITY_NORMAL = 1;
 const MAX_QUEUE_SIZE = 32;
 const DEFAULT_ROUTE_ID = "/";
 const MIN_BYTES = 0;
-const DOWNLINK_MBPS_TO_BYTES_PER_MS = 125; // Mbps * 125 = bytes/ms
 
 // ============================================================================
 // Flight Scheduler Class
@@ -132,7 +110,7 @@ export class FlightScheduler {
    */
   pruneInactive(
     activeKeys: ReadonlySet<IslandKey>,
-    now = performance.now(),
+    now: number = performance.now(),
   ): void {
     const idleTtl = this.config.prefetchTTLms;
 
@@ -140,7 +118,7 @@ export class FlightScheduler {
       if (activeKeys.has(key)) continue;
 
       // Only prune safe states (never prune in-progress operations)
-      if (st.st === "Idle" && now - st.lastActionTs > idleTtl) {
+      if (st.st === IslandSt.Idle && now - st.lastActionTs > idleTtl) {
         this.states.delete(key);
         this.queuedKeys.delete(key);
       }
@@ -187,14 +165,16 @@ export class FlightScheduler {
     _reason = "event",
     now = performance.now(),
   ): Promise<void> {
-    const type = this.getIslandType(handle.key);
-    if (!type) return;
-
-    // Cancel prefetch to avoid budget leaks
-    this.cancelPrefetchIfActive(handle.key, now);
-
     const state = this.getState(handle.key, now);
+
     if (isHydrateInProgress(state)) return;
+
+    // Si se está pre-cargando, esperamos a que termine en lugar de abortar
+    if (state.st === IslandSt.Prefetching && state.handle?.done) {
+      await state.handle.done;
+    } else {
+      this.cancelPrefetchIfActive(handle.key, now);
+    }
 
     await this.executeHydration(handle, props, now);
   }
@@ -297,7 +277,7 @@ export class FlightScheduler {
     const state = this.getState(key, now);
 
     // Can only prefetch from idle state (not in cooldown)
-    if (state.st !== "Idle") return null;
+    if (state.st !== IslandSt.Idle) return null;
     if (now < state.cooldownUntil) return null;
 
     const estBytes = Math.max(MIN_BYTES, type.estBytes | 0);
@@ -344,9 +324,9 @@ export class FlightScheduler {
 
   private advanceState(state: IslandState, now: number): IslandState {
     switch (state.st) {
-      case "Prefetching":
+      case IslandSt.Prefetching:
         return this.advancePrefetchingState(state, now);
-      case "Prefetched":
+      case IslandSt.Prefetched:
         return this.advancePrefetchedState(state, now);
       default:
         return state;
@@ -354,13 +334,13 @@ export class FlightScheduler {
   }
 
   private advancePrefetchingState(
-    state: Extract<IslandState, { st: "Prefetching" }>,
+    state: Extract<IslandState, { st: IslandSt.Prefetching }>,
     now: number,
   ): IslandState {
     const elapsed = now - state.startedTs;
     const readyThreshold = Math.max(
       this.config.assumeReadyDelayMs,
-      state.readyDelayMs,
+      state.readyDelayMs * 2,
     );
 
     if (elapsed >= readyThreshold) {
@@ -372,7 +352,7 @@ export class FlightScheduler {
   }
 
   private advancePrefetchedState(
-    state: Extract<IslandState, { st: "Prefetched" }>,
+    state: Extract<IslandState, { st: IslandSt.Prefetched }>,
     now: number,
   ): IslandState {
     if (now >= state.expiresTs) {
@@ -383,8 +363,13 @@ export class FlightScheduler {
 
   private handleStateTransition(from: IslandState, to: IslandState): void {
     // Release budgets when Prefetching -> Prefetched naturally completes
-    if (from.st === "Prefetching" && to.st === "Prefetched") {
-      this.releaseFlightResources(from.bytes);
+    if (from.st === IslandSt.Prefetching) {
+      const shouldProcessFlight = to.st === IslandSt.Prefetched ||
+        to.st === IslandSt.Idle ||
+        to.st === IslandSt.Hydrating;
+      if (shouldProcessFlight) {
+        this.releaseFlightResources(from.bytes);
+      }
     }
   }
 
@@ -459,7 +444,7 @@ export class FlightScheduler {
   }
 
   private canPrefetchFromState(state: IslandState, now: number): boolean {
-    return state.st === "Idle" && now >= state.cooldownUntil;
+    return state.st === IslandSt.Idle && now >= state.cooldownUntil;
   }
 
   private tryDispatchPrefetch(item: QueueItem, now: number): DispatchResult {
@@ -490,17 +475,12 @@ export class FlightScheduler {
     now: number,
   ): boolean {
     const readyDelayMs = this.estimateReadyDelay(bytes, now);
+    const handle = this.initiatePrefetch(type, flags);
 
-    let handle: { abort?: () => void } | null = null;
-    try {
-      handle = this.actuators.prefetch(type, flags);
-    } catch {
-      // Prefetch failed; don't allocate budgets
-      return false;
-    }
+    if (!handle) return false;
 
-    // Allocate budgets and transition to Prefetching
     this.allocateFlightResources(bytes);
+    this.attachCompletionHandler(key, handle);
     this.setState(
       key,
       createPrefetchingState(now, bytes, readyDelayMs, handle),
@@ -509,6 +489,32 @@ export class FlightScheduler {
     return true;
   }
 
+  private initiatePrefetch(
+    type: IslandTypeDef,
+    flags: number,
+  ): PrefetchHandle | null {
+    try {
+      return this.actuators.prefetch(type, flags);
+    } catch {
+      return null;
+    }
+  }
+
+  private attachCompletionHandler(
+    key: IslandKey,
+    handle: PrefetchHandle,
+  ): void {
+    handle.done?.then(() => {
+      const state = this.states.get(key);
+      if (state?.st === IslandSt.Prefetching) {
+        const finishTs = performance.now();
+        this.setState(
+          key,
+          createPrefetchedState(finishTs, finishTs + this.config.prefetchTTLms),
+        );
+      }
+    });
+  }
   // ========================================================================
   // Private - Hydration
   // ========================================================================
@@ -589,7 +595,7 @@ export class FlightScheduler {
   private cancelPrefetchIfActive(key: IslandKey, now: number): void {
     const state = this.getState(key, now);
 
-    if (state.st === "Prefetching") {
+    if (state.st === IslandSt.Prefetching) {
       this.abortPrefetch(state.handle);
       this.releaseFlightResources(state.bytes);
       this.setState(key, createIdleState(now));
@@ -606,7 +612,7 @@ export class FlightScheduler {
 
   private transitionToIdleWithCooldown(key: IslandKey, now: number): void {
     this.setState(key, {
-      st: "Idle",
+      st: IslandSt.Idle,
       lastActionTs: now,
       cooldownUntil: now + this.config.falsePositiveCooldownMs,
     });
@@ -643,7 +649,7 @@ export class FlightScheduler {
     if (this.cachedDownlinkBytesPerMs <= 0) return base;
 
     const estimatedMs = bytes / this.cachedDownlinkBytesPerMs;
-    return clampRange(estimatedMs, base, max);
+    return clamp(estimatedMs, base, max);
   }
 }
 
@@ -652,17 +658,17 @@ export class FlightScheduler {
 // ============================================================================
 
 function createIdleState(timestamp: number): IslandState {
-  return { st: "Idle", lastActionTs: timestamp, cooldownUntil: 0 };
+  return { st: IslandSt.Idle, lastActionTs: timestamp, cooldownUntil: 0 };
 }
 
 function createPrefetchingState(
   timestamp: number,
   bytes: number,
   readyDelayMs: number,
-  handle: { abort?: () => void } | null,
+  handle: PrefetchHandle | null,
 ): IslandState {
   return {
-    st: "Prefetching",
+    st: IslandSt.Prefetching,
     startedTs: timestamp,
     bytes,
     readyDelayMs,
@@ -674,15 +680,15 @@ function createPrefetchedState(
   readyTs: number,
   expiresTs: number,
 ): IslandState {
-  return { st: "Prefetched", readyTs, expiresTs };
+  return { st: IslandSt.Prefetched, readyTs, expiresTs };
 }
 
 function createHydratingState(timestamp: number): IslandState {
-  return { st: "Hydrating", startedTs: timestamp };
+  return { st: IslandSt.Hydrating, startedTs: timestamp };
 }
 
 function createHydratedState(timestamp: number): IslandState {
-  return { st: "Hydrated", readyTs: timestamp };
+  return { st: IslandSt.Hydrated, readyTs: timestamp };
 }
 
 // ============================================================================
@@ -690,35 +696,5 @@ function createHydratedState(timestamp: number): IslandState {
 // ============================================================================
 
 function isHydrateInProgress(state: IslandState): boolean {
-  return state.st === "Hydrated" || state.st === "Hydrating";
-}
-
-// ============================================================================
-// Network Helpers
-// ============================================================================
-
-function getDownlinkBytesPerMs(): number {
-  const nav = globalThis.navigator as unknown as
-    | { connection?: { downlink?: number } }
-    | undefined;
-
-  const mbps = nav?.connection?.downlink;
-
-  if (typeof mbps === "number" && mbps > 0) {
-    return mbps * DOWNLINK_MBPS_TO_BYTES_PER_MS;
-  }
-
-  return 0;
-}
-
-function clampRange(x: number, min: number, max: number): number {
-  return x < min ? min : x > max ? max : x;
-}
-
-// ============================================================================
-// Island Helpers
-// ============================================================================
-
-function createIslandId(key: IslandKey): string {
-  return key.toString(36);
+  return state.st === IslandSt.Hydrated || state.st === IslandSt.Hydrating;
 }

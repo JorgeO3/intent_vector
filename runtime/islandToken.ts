@@ -38,22 +38,20 @@ const BASE_36 = 36;
  * Lookup table for debug token keys.
  * Supports both short (t, p, f) and long (type, props, flags) formats.
  */
-const DEBUG_KEY_LOOKUP: Readonly<Record<string, DebugProperty>> = Object.freeze(
-  {
-    t: "typeId",
-    type: "typeId",
-    p: "propsId",
-    props: "propsId",
-    f: "flags",
-    flags: "flags",
-  },
-);
+const DEBUG_KEY_LOOKUP: Readonly<Record<string, DebugProperty>> = {
+  t: "typeId",
+  type: "typeId",
+  p: "propsId",
+  props: "propsId",
+  f: "flags",
+  flags: "flags",
+} as const;
 
-const DEBUG_DEFAULTS: Readonly<DebugTokenParts> = Object.freeze({
+const DEBUG_DEFAULTS: Readonly<DebugTokenParts> = {
   typeId: 0,
   propsId: 0,
   flags: 0,
-});
+} as const;
 
 const DEBUG_TOKEN_SEPARATORS = /[,\s]+/;
 const KEY_VALUE_SEPARATOR = "=";

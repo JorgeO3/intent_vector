@@ -1,12 +1,9 @@
+import type { LedgerConfig } from "./types.ts";
+import { computeEMA, clamp } from "./utils.ts";
+
 // ============================================================================
 // Type Definitions
 // ============================================================================
-
-export type LedgerConfig = {
-  readonly emaAlpha: number;
-  readonly minPrior: number;
-  readonly maxPrior: number;
-};
 
 type StatRecord = {
   prior: number;
@@ -132,10 +129,6 @@ function createInitialStat(timestamp: number): StatRecord {
 // Math Helpers
 // ============================================================================
 
-function computeEMA(current: number, target: number, alpha: number): number {
-  return (1 - alpha) * current + alpha * target;
-}
-
 function clampPrior(value: number, min: number, max: number): number {
-  return Math.max(min, Math.min(max, value));
+  return clamp(value, min, max);
 }
